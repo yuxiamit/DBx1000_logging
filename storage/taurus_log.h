@@ -2,21 +2,7 @@
 
 #include "global.h"
 #include "pthread.h"
-#include "row.h"
 #include <queue>
-
-#if LOG_ALGORITHM == LOG_TAURUS
-
-/* Log Partition for Plover and Taurus */
-inline uint64_t logPartition(uint64_t key)
-{
-#if PARTITION_AWARE
-    static_assert(sizeof(row_t)==ALIGN_SIZE);
-	return (key / ALIGN_SIZE / 2) % g_num_logger;
-#else
-    return 0;
-#endif
-}
 
 class TaurusLogManager 
 {
@@ -29,7 +15,7 @@ class TaurusLogManager
 	uint64_t get_persistent_lsn(); 
 	
 	// For logging
-    uint64_t serialLogTxn(char * log_entry, uint32_t entry_size, lsnType * lsn_vec, uint32_t designated_logger_id);
+    uint64_t serialLogTxn(char * log_entry, uint32_t entry_size, lsnType * lsn_vec);
 
     uint64_t flushPSN();
 	// For recovery 
@@ -54,5 +40,3 @@ class TaurusLogManager
     uint64_t ** endLV;
     uint64_t padding4[8];
 };
-
-#endif

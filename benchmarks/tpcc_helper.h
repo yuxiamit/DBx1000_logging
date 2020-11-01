@@ -7,16 +7,21 @@ extern uint64_t C_255, C_1023, C_8191;
 
 uint64_t distKey(uint64_t d_id, uint64_t d_w_id);
 uint64_t custKey(uint64_t c_id, uint64_t c_d_id, uint64_t c_w_id);
-uint64_t orderlineKey(uint64_t w_id, uint64_t d_id, uint64_t o_id);
-uint64_t orderPrimaryKey(uint64_t w_id, uint64_t d_id, uint64_t o_id);
+uint64_t orderKey(int64_t o_id, uint64_t o_d_id, uint64_t o_w_id);
+uint64_t neworderKey(int64_t o_id, uint64_t o_d_id, uint64_t o_w_id);
+uint64_t orderCustKey(int64_t o_id, uint64_t o_c_id, uint64_t o_d_id, uint64_t o_w_id);
+//uint64_t orderlineKeyOld(uint64_t w_id, uint64_t d_id, uint64_t o_id);
+uint64_t orderlineKey(uint64_t ol_number, int64_t ol_o_id, uint64_t ol_d_id,
+                      uint64_t ol_w_id);
+//uint64_t orderPrimaryKey(uint64_t w_id, uint64_t d_id, uint64_t o_id);
 // non-primary key
 uint64_t custNPKey(char * c_last, uint64_t c_d_id, uint64_t c_w_id);
 uint64_t stockKey(uint64_t s_i_id, uint64_t s_w_id);
 
 uint64_t Lastname(uint64_t num, char* name);
 
-//extern drand48_data ** tpcc_buffer;
-extern unsigned short ** tpcc_buffer;
+extern drand48_data ** tpcc_buffer;
+//extern unsigned short ** tpcc_buffer;
 // return random data from [0, max-1]
 uint64_t RAND(uint64_t max);
 uint64_t RAND(uint64_t max, uint64_t thd_id);

@@ -19,18 +19,15 @@ void Row_lock::init(row_t * row) {
 	// owner_cnt = 0;
 	//waiter_cnt = 0;
 
-#if ATOMIC_WORD
-	lock = 0;
-#else
-	#if !USE_LOCKTABLE
-		//latch = new pthread_mutex_t;
-		//pthread_mutex_init(latch, NULL);
-		blatch = false;
-	#endif
-		
-		lock_type = LOCK_NONE_T;
-		ownerCounter = 0;
+	
+#if !USE_LOCKTABLE
+	latch = new pthread_mutex_t;
+	pthread_mutex_init(latch, NULL);
+	blatch = false;
 #endif
+	
+	lock_type = LOCK_NONE_T;
+	ownerCounter = 0;
 
 }
 
@@ -44,67 +41,17 @@ RC Row_lock::lock_get(lock_t type, txn_man * txn, uint64_t* &txnids, int &txncnt
 	uint64_t starttime = get_sys_clock();
 	assert (CC_ALG == DL_DETECT || CC_ALG == NO_WAIT || CC_ALG == WAIT_DIE);
 	RC rc;
-#if ATOMIC_WORD
-	//assert(type<3);
-	#if !USE_LOCKTABLE
-	uint64_t lock_local=lock;
-	if(CONFLICT(LOCK_TYPE(lock_local), type))
-	{
-		rc = Abort;
-	}
-	else
-	{
-		for(;;)
-		{
-			lock_local = lock;
-			if(CONFLICT(LOCK_TYPE(lock_local), type))
-			{
-				rc = Abort;
-				break;
-			}
-			if(ATOM_CAS(lock, lock_local, ADD_TYPE(COUNTER(lock_local)+1, type)))
-			{
-				rc = RCOK;
-				break;
-			}
-			PAUSE
-		}
-		/*
-		if(ATOM_CAS(lock, lock_local, ADD_TYPE(COUNTER(lock_local)+1, type)))
-		{
-			rc = RCOK;
-		}
-		else
-		{
-			rc = Abort;
-		}
-		*/
-	}
-	
-	#else
-	// we are inside an atomic section
-	bool conflict = CONFLICT(LOCK_TYPE(lock), type);
-	if(conflict)
-	{
-		rc = Abort;
-	}
-	else
-	{
-		lock = ADD_TYPE(COUNTER(lock)+1, type);
-		rc = RCOK;
-	}
-	#endif
-#else
+	//int part_id =_row->get_part_id();
 #if !USE_LOCKTABLE  // otherwise we don't need a latch here.
 	if (g_central_man)
-	{
 		glob_manager->lock_row(_row);
-	}
-	else {
-		while(!ATOM_CAS(blatch, false, true)) PAUSE;
-		//pthread_mutex_lock( latch );
-	}
+	else 
+		pthread_mutex_lock( latch );
 #endif
+	
+	// IMPORTANT: for simplicity, 
+	// we assume that if a transaction reads and writes to the same tuple
+	// it will first acquired the exclusive lock.
 	bool conflict = CONFLICT(lock_type, type);// conflict_lock(lock_type, type);
 	if (conflict) { 
 		// Cannot be added to the owner list.
@@ -113,7 +60,11 @@ RC Row_lock::lock_get(lock_t type, txn_man * txn, uint64_t* &txnids, int &txncnt
 		}
 	} else {
 		INC_INT_STATS(time_debug6, get_sys_clock() - starttime);
+		//LockEntry entry = LockEntry {type, txn}; 
+		//++ owner_cnt;
+		//_owners.push_back(entry);
 		ownerCounter ++;
+		//printf("[%" PRIu64 "] Pushed %" PRIu64 " with type %d, current locktype %d\n", (uint64_t) _row, (uint64_t) txn, type, lock_type);
 		lock_type = type;
         rc = RCOK;
 	}
@@ -121,9 +72,7 @@ RC Row_lock::lock_get(lock_t type, txn_man * txn, uint64_t* &txnids, int &txncnt
 	if (g_central_man)
 		glob_manager->release_row(_row);
 	else
-		blatch = false;
-		//pthread_mutex_unlock( latch );
-#endif
+		pthread_mutex_unlock( latch );
 #endif
 	INC_INT_STATS(time_debug7, get_sys_clock() - starttime);
 	return rc;
@@ -131,42 +80,27 @@ RC Row_lock::lock_get(lock_t type, txn_man * txn, uint64_t* &txnids, int &txncnt
 
 
 RC Row_lock::lock_release(txn_man * txn) {	
-#if ATOMIC_WORD
-#if USE_LOCKTABLE
-	lock --;
-	if (COUNTER(lock) == 0)
-		lock = 0;
-#else
-	for(;;)
-	{
-		uint64_t local_lock = lock;
-		uint64_t new_lock = local_lock - 1;
-		if (COUNTER(new_lock) == 0)
-		{
-			new_lock = 0;
-		}
-		if(ATOM_CAS(lock, local_lock, new_lock))
-			break;
-		PAUSE
-	}
-#endif
-#else
+
 #if !USE_LOCKTABLE  // otherwise we don't need a latch here.
 	if (g_central_man)
 		glob_manager->lock_row(_row);
-	else
-		while(!ATOM_CAS(blatch, false, true)) PAUSE;
-		//pthread_mutex_lock( latch );
+	else 
+		pthread_mutex_lock( latch );
 #endif
+
 	ownerCounter --;
+#if (CC_ALG == NO_WAIT)
+	//assert(found);
+#endif
+	
 	if (ownerCounter == 0)//(_owners.empty())
 		lock_type = LOCK_NONE_T;
+
 #if !USE_LOCKTABLE  // otherwise we don't need a latch here.
 	if (g_central_man)
 		glob_manager->release_row(_row);
 	else
-		blatch = 0;
-#endif
+		pthread_mutex_unlock( latch );
 #endif
 	return RCOK;
 }

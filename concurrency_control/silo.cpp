@@ -59,6 +59,8 @@ txn_man::validate_silo_serial()
 	uint32_t num_locks = 0;
 	//uint32_t num_shared_locks = 0;
 	ts_t max_tid = 0;
+	// calculated max_tid
+	
 	for (uint32_t i = 0; i < row_cnt; i ++) {
 		Access * access = accesses[i];
 		if (access->tid > max_tid)
@@ -114,7 +116,7 @@ txn_man::validate_silo_serial()
 			for (uint32_t i = 0; i < row_cnt; i++) {
 				Access * access = accesses[dd[i]];
 				row_t * row = access->orig_row;
-				if (!row->manager->try_lock(this, access->type == RD))
+				if (!row->manager->try_lock(access->type == RD))
 					break;
 				//row->manager->assert_lock();
 				num_locks ++;
@@ -130,7 +132,7 @@ txn_man::validate_silo_serial()
 				for (uint32_t i = num_locks; i > 0; i--)
 				{
 					Access * access = accesses[dd[i-1]];
-					access->orig_row->manager->release(this, Abort, access->type == RD);
+					access->orig_row->manager->release(access->type == RD);
 				}
 				if (_pre_abort) {
 					num_locks = 0;
@@ -158,7 +160,7 @@ txn_man::validate_silo_serial()
 		for (uint32_t i = 0; i < row_cnt; i++) {
 			Access * access = accesses[dd[i]];
 			row_t * row = access->orig_row;
-			row->manager->lock(this, access->type == RD);
+			row->manager->lock(access->type == RD);
 			num_locks++;
 			if (row->manager->get_tid() != accesses[dd[i]]->tid) {
 				rc = Abort;
@@ -194,7 +196,7 @@ final:
 		for (uint32_t i = num_locks; i > 0; i--)
 		{
 			Access * access = accesses[dd[i-1]];
-			access->orig_row->manager->release(this, Abort, access->type == RD);
+			access->orig_row->manager->release(access->type == RD);
 		}
 
 		tc6 = get_sys_clock(); // after release the lock
@@ -220,7 +222,7 @@ final:
 				for (uint32_t i = num_locks; i > 0; i--)
 				{
 					Access * access = accesses[dd[i-1]];
-					access->orig_row->manager->release(this, Abort, access->type == RD);
+					access->orig_row->manager->release(access->type == RD);
 				}
 				uint64_t tc7 = get_sys_clock(); // after release the lock
 				INC_INT_STATS(time_silo_validate7, tc7 - tc5);
@@ -245,7 +247,7 @@ final:
 				access->orig_row->manager->write( 
 					access->data, _cur_tid
 				);
-				accesses[ write_set[i] ]->orig_row->manager->release(this, RCOK);
+				accesses[ write_set[i] ]->orig_row->manager->release();
 			}
 		}
 		for (uint32_t i = 0; i < row_cnt - tmp_wr_cnt; i++) {
@@ -260,7 +262,7 @@ final:
 					v = access->orig_row->manager->_tid_word;
 					vtid = v & LOCK_TID_MASK;
 				}
-				access->orig_row->manager->release(this, RCOK, true);
+				access->orig_row->manager->release(true);
 			}
 		}
 		tc9 = get_sys_clock(); // after release the lock
@@ -337,14 +339,12 @@ txn_man::validate_silo()
 
 	uint32_t num_locks = 0;
 	ts_t max_tid = 0;
-
+	// calculated max_tid
+	
 	for (uint32_t i = 0; i < row_cnt; i ++) {
 		Access * access = accesses[i];
 		if (access->tid > max_tid)
 			max_tid = access->tid;
-		assert(access->tid < 0xffffffffff);
-		// this assertion can not be removed, otherwise O3 would break max_tid
-		//printf("max_tid = %lu, access[%i]->tid=%lu\n", max_tid, i, access->tid);
 	}
 	if (max_tid > _cur_tid)
 		_cur_tid = max_tid + 1;
@@ -358,7 +358,7 @@ txn_man::validate_silo()
 		_cur_tid = *log_manager->lastLoggedTID + 1;
 	// in case some workers fall behind too much
 #endif
-	//printf("max_tid = %lu\n", max_tid);
+
 	assert((_cur_tid & LOCK_BIT) == 0);
 
 //#if !USE_LOCKTABLE
@@ -395,7 +395,7 @@ txn_man::validate_silo()
 #if USE_LOCKTABLE
 	// assume validation_no_wait
 	// _epoch = glob_manager->get_epoch();	
-	// print("!!!!\n");
+	
 	if(_validation_no_wait)
 	{
 		while (!done) {
@@ -408,13 +408,11 @@ txn_man::validate_silo()
 				RC local = lt.get_row(row, access->type, this, tempvar, lsn_vector, NULL, true, access->tid, true);
 				#elif LOG_ALGORITHM == LOG_SERIAL
 				RC local = lt.get_row(row, access->type, this, tempvar, NULL, &_max_lsn, true, access->tid, true);
-				#elif LOG_ALGORITHM == LOG_NO || LOG_ALGORITHM == LOG_BATCH
+				#elif LOG_ALGORITHM == LOG_NO
 				RC local = lt.get_row(row, access->type, this, tempvar, NULL, NULL, true, access->tid, true);
-				#else
-				assert(false);
 				#endif
 				starttime = get_sys_clock();
-				INC_INT_STATS_V0(time_locktable_get_validation, starttime - right_before_get);
+				INC_INT_STATS(time_locktable_get_validation, starttime - right_before_get);
 				//#if LOG_ALGORITHM != LOG_NO
 				if(local == Abort)
 				{
@@ -433,7 +431,7 @@ txn_man::validate_silo()
 				for (uint32_t i = 0; i < num_locks; i++) 
 				{
 					Access * access = accesses[ write_set[i] ];
-					access->orig_row->manager->release(this, Abort); // we do not change the lsn here.
+					access->orig_row->manager->release(); // we do not change the lsn here.
 				}
 				if (_pre_abort) {
 					num_locks = 0;
@@ -467,10 +465,8 @@ txn_man::validate_silo()
 			RC local = lt.get_row(row, access->type, this, tempvar, lsn_vector, NULL, true, access->tid, true);
 			#elif LOG_ALGORITHM == LOG_SERIAL
 			RC local = lt.get_row(row, access->type, this, tempvar, NULL, &_max_lsn, true, access->tid, true);
-			#elif LOG_ALGORITHM == LOG_NO || LOG_ALGORITHM == LOG_BATCH
+			#elif LOG_ALGORITHM == LOG_NO
 			RC local = lt.get_row(row, access->type, this, tempvar, NULL, NULL, true, access->tid, true);
-			#else
-			assert(false);
 			#endif
 			//#if LOG_ALGORITHM != LOG_NO
 			if(local == Abort)
@@ -496,7 +492,7 @@ txn_man::validate_silo()
 			num_locks = 0;
 			for (uint32_t i = 0; i < tmp_wr_cnt; i++) {
 				row_t * row = accesses[ write_set[i] ]->orig_row;
-				if (!row->manager->try_lock(this))
+				if (!row->manager->try_lock())
 					break;
 				row->manager->assert_lock();
 				num_locks ++;
@@ -510,7 +506,7 @@ txn_man::validate_silo()
 				done = true;
 			else {
 				for (uint32_t i = 0; i < num_locks; i++)
-					accesses[ write_set[i] ]->orig_row->manager->release(this, Abort);
+					accesses[ write_set[i] ]->orig_row->manager->release();
 				if (_pre_abort) {
 					num_locks = 0;
 					for (uint32_t i = 0; i < tmp_wr_cnt; i++) {
@@ -536,7 +532,7 @@ txn_man::validate_silo()
 	} else {
 		for (uint32_t i = 0; i < tmp_wr_cnt; i++) {
 			row_t * row = accesses[ write_set[i] ]->orig_row;
-			row->manager->lock(this);
+			row->manager->lock();
 			num_locks++;
 			if (row->manager->get_tid() != accesses[write_set[i]]->tid) {
 				rc = Abort;
@@ -558,11 +554,7 @@ txn_man::validate_silo()
 				goto final;
 		}
 		// fetch LV to update txn_lv
-#if USE_LOCKTABLE
 		lt.updateLSN(access->orig_row, lsn_vector);
-#else
-		// TODO
-#endif
 	}
 
 #endif
@@ -586,18 +578,20 @@ txn_man::validate_silo()
 	}
 #endif
 	
+
 final:
 	tc5 = get_sys_clock(); // after update lsn_vector
 	INC_INT_STATS(time_silo_validate5, tc5 - startVal);
 	if (rc == Abort) {
 #if !USE_LOCKTABLE	
 		for (uint32_t i = 0; i < num_locks; i++) 
-			accesses[ write_set[i] ]->orig_row->manager->release(this, Abort);
+			accesses[ write_set[i] ]->orig_row->manager->release();
 #else
 		for (uint32_t i = 0; i < num_locks; i++) 
 		{
 			Access * access = accesses[ write_set[i] ];
-            access->orig_row->manager->release(this, Abort);
+			
+            access->orig_row->manager->release();
 		}
 #endif
 		tc6 = get_sys_clock(); // after release the lock
@@ -633,50 +627,20 @@ final:
 			uint64_t tid = log_manager[logger_id]->logTxn(_log_entry, _log_entry_size, _epoch);
 #elif LOG_ALGORITHM == LOG_TAURUS
 			
-#if PARTITION_AWARE
-			uint64_t partition_max_access = 0;
-			uint64_t max_access_count = 0;
-			target_logger_id = 0; // GET_THD_ID % g_num_logger;
-			for(uint32_t i=0; i<g_num_logger; i++)
-				if(partition_accesses_cnt[i] > partition_max_access)
-				{
-					partition_max_access = partition_accesses_cnt[i];
-					//target_logger_id = i;
-					max_access_count = 1;
-				}
-				else if(partition_accesses_cnt[i] == partition_max_access)
-				{
-					max_access_count ++;
-				}
-			// among all the ties, choose by random
-			uint64_t target_id = GET_THD_ID % max_access_count;
-			for(uint32_t i=0; i<g_num_logger; i++)
-				if(partition_accesses_cnt[i] == partition_max_access)
-				{
-					if(target_id==0)
-					{
-						target_logger_id = i;
-						break;
-					}
-					target_id--;
-				}
-			uint64_t tid = log_manager->serialLogTxn(_log_entry, _log_entry_size, lsn_vector, target_logger_id);
-#else
-			uint64_t tid = log_manager->serialLogTxn(_log_entry, _log_entry_size, lsn_vector, GET_THD_ID % g_num_logger);
-#endif
+			uint64_t tid = log_manager->serialLogTxn(_log_entry, _log_entry_size, lsn_vector);
 #endif
 #if LOG_ALGORITHM != LOG_NO
 			// If tid == -1, the log buffer is full. Should abort the current transaction.  
 			if (tid == (uint64_t)-1) {
 #if !USE_LOCKTABLE	
 				for (uint32_t i = 0; i < num_locks; i++) 
-					accesses[ write_set[i] ]->orig_row->manager->release(this, Abort);
+					accesses[ write_set[i] ]->orig_row->manager->release();
 #else
 				for (uint32_t i = 0; i < num_locks; i++) 
 				{
 					Access * access = accesses[ write_set[i] ];
 					
-                    access->orig_row->manager->release(this, Abort);
+                    access->orig_row->manager->release();
 				}
 #endif
 				uint64_t tc7 = get_sys_clock(); // after release the lock
@@ -708,7 +672,7 @@ final:
 				access->orig_row->manager->_tid_word = _cur_tid | LOCK_BIT;
 #endif
 #if !USE_LOCKTABLE
-			accesses[ write_set[i] ]->orig_row->manager->release(this, RCOK);
+			accesses[ write_set[i] ]->orig_row->manager->release();
 #else
 			//Access * access = accesses[ write_set[i] ];
 			#if LOG_ALGORITHM== LOG_TAURUS

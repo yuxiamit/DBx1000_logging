@@ -8,7 +8,9 @@
 
 #define SET_VALUE(type) \
 	void row_t::set_value(int col_id, type value) { \
-		set_value(col_id, &value); \
+		int datasize = get_schema()->get_field_size(col_id); \
+		int pos = get_schema()->get_field_index(col_id); \
+		memcpy( &data[pos], &value, datasize);\
 	}
 
 #define DECL_GET_VALUE(type)\
@@ -37,13 +39,13 @@ class row_t
 public:
 
 	RC init(table_t * host_table, uint64_t part_id, uint64_t row_id = 0);
-	RC init(table_t * host_table, uint64_t part_id, uint64_t row_id, void * mem, void * lsn_vec_mem);
+	RC init(table_t * host_table, uint64_t part_id, uint64_t row_id, void * mem);
 	void init(int size);
 	RC switch_schema(table_t * host_table);
 	// not every row has a manager
 	static size_t get_manager_size();
 	void init_manager(row_t * row);
-	void init_manager(row_t * row, void* manager_ptr);
+	void init_manager(row_t * row, void* ptr);
 
 	table_t * get_table();
 	Catalog * get_schema();
@@ -88,11 +90,14 @@ public:
 	char * get_data(txn_man * txn, access_t type);
 
 	void free_row();
+	
+	static size_t alloc_size(table_t* t);
+	static size_t max_alloc_size();
 
 	// for concurrency control. can be lock, timestamp etc.
 	//RC get_row(access_t type, txn_man * txn, row_t *& row);
 	RC get_row(access_t type, txn_man * txn, char *&data);
-	void return_row(access_t type, txn_man * txn, char * data, RC rc_in);
+	void return_row(access_t type, txn_man * txn, char * data);
 	
 #if CC_ALG == DL_DETECT || CC_ALG == NO_WAIT || CC_ALG == WAIT_DIE
     Row_lock * manager;
@@ -111,21 +116,10 @@ public:
 #elif CC_ALG == VLL
   	Row_vll * manager;
 #endif
-
-#if !USE_LOCKTABLE
-// metadata if not using locktable
-#if LOG_ALGORITHM == LOG_TAURUS
-	lsnType * lsn_vec;
-    lsnType * readLV;
-#elif LOG_ALGORITHM == LOG_SERIAL
-	lsnType * lsn;
-#elif LOG_ALGORITHM == LOG_BATCH
-	//
-#endif
-#endif
-
+public:
 	char * data;
 	table_t * table;
+	volatile uint8_t is_deleted;
 
 	uint64_t 		get_last_writer()	
 	{ return _last_writer; };
@@ -144,4 +138,18 @@ private:
 	uint64_t		_part_id;
 	uint64_t 		_row_id;
 
+/*#if LOG_ALGORITHM == LOG_PARALLEL && LOG_TYPE == LOG_COMMAND && LOG_RECOVER
+	// for paralle command recovery, should use multi-versioning.
+	struct Version {
+		uint64_t txn_id; // the writer's txn_id
+		uint64_t ts; // time stamp of the writer
+		char * data;
+		Version * next;
+	};
+	Version *       _version;
+	uint32_t 		_num_versions; // for debug 
+	uint64_t 		_min_ts; // the oldest version timestamp of the tuple
+	uint32_t		_gc_time;
+#endif
+*/
 };

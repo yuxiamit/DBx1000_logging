@@ -8,9 +8,13 @@
 #include "table.h"
 #include "catalog.h"
 #include "index_btree.h"
+#include "index_array.h"
+#include "index_mbtree.h"
 #include "index_hash.h"
 #include "log.h"
-#include "log_alg_list.h"
+#include "serial_log.h"
+#include "parallel_log.h"
+#include "taurus_log.h"
 #include "log_recover_table.h"
 #include "log_pending_table.h"
 #include "free_queue.h"
@@ -20,7 +24,6 @@
 #include "logging_thread.h"
 #include <inttypes.h>
 #include <sstream>
-#include "numa.h"
 
 #if LOG_ALGORITHM == LOG_BATCH
 pthread_mutex_t * txn_man::_log_lock;
@@ -28,7 +31,7 @@ pthread_mutex_t * txn_man::_log_lock;
 
 #if LOG_ALGORITHM == LOG_TAURUS
 
-#define UPDATE_RECOVER_LSN_DIRECT if(g_zipf_theta <= CONTENTION_THRESHOLD  || PER_WORKER_RECOVERY){ \
+#define UPDATE_RECOVER_LSN_DIRECT if(g_zipf_theta <= CONTENTION_THRESHOLD){ \
                             uint64_t rlv = UINT64_MAX; \
                             for(uint64_t i=0; i<num_worker/POOL_SE_SPACE;i++) \
                             { \
@@ -50,7 +53,7 @@ pthread_mutex_t * txn_man::_log_lock;
                                 ATOM_CAS(*log_manager->recoverLVSPSC_min[realLogId], tl, rlv); \
 						}
 
-#define UPDATE_RECOVER_LSN_INDIRECT if(g_zipf_theta <= CONTENTION_THRESHOLD  || PER_WORKER_RECOVERY){ \
+#define UPDATE_RECOVER_LSN_INDIRECT if(g_zipf_theta <= CONTENTION_THRESHOLD){ \
                             uint64_t rlv = UINT64_MAX; \
                             for(uint64_t i=0; i<num_worker/POOL_SE_SPACE;i++) \
                             { \
@@ -76,14 +79,21 @@ void txn_man::init(thread_t * h_thd, workload * h_wl, uint64_t thd_id) {
 	row_cnt = 0;
 	wr_cnt = 0;
 	insert_cnt = 0;
+	remove_cnt = 0;
+	scan_cnt = 0;
+	insert_idx_cnt = 0;
+	remove_idx_cnt = 0;
+	node_map.clear();
+
 #if WORKLOAD == YCSB
-	accesses = (Access **) MALLOC(sizeof(Access *) * g_req_per_query, GET_THD_ID);
-	write_set = (uint32_t *) MALLOC(sizeof(uint32_t) * g_req_per_query, GET_THD_ID);
+	accesses = (Access **) _mm_malloc(sizeof(Access *) * g_req_per_query, ALIGN_SIZE);
+	write_set = (uint32_t *) _mm_malloc(sizeof(uint32_t) * g_req_per_query, ALIGN_SIZE);
 	for (uint32_t i = 0; i < g_req_per_query; i++)
 		accesses[i] = NULL;
 #elif WORKLOAD == TPCC
-	accesses = (Access **) MALLOC(sizeof(Access *) * MAX_ROW_PER_TXN, GET_THD_ID);
-	write_set = (uint32_t *) MALLOC(sizeof(uint32_t) * MAX_ROW_PER_TXN, GET_THD_ID);
+	scan_results = (ScanHistory*) _mm_malloc(sizeof(ScanHistory) * MAX_SCAN_PER_TXN, ALIGN_SIZE);
+	accesses = (Access **) _mm_malloc(sizeof(Access *) * MAX_ROW_PER_TXN, ALIGN_SIZE);
+	write_set = (uint32_t *) _mm_malloc(sizeof(uint32_t) * MAX_ROW_PER_TXN, ALIGN_SIZE);
 	for (uint32_t i = 0; i < MAX_ROW_PER_TXN; i++)
 		accesses[i] = NULL;
 #else
@@ -102,7 +112,8 @@ void txn_man::init(thread_t * h_thd, workload * h_wl, uint64_t thd_id) {
 #elif CC_ALG == SILO || LOG_ALGORITHM == LOG_SERIAL
 	_cur_tid = 0;
 #endif
-	_last_epoch_time = 0;
+	_last_epoch_time = 0;	
+	_log_entry_size = 0;
 
 #if LOG_ALGORITHM == LOG_PARALLEL
 	_num_raw_preds = 0;
@@ -112,49 +123,28 @@ void txn_man::init(thread_t * h_thd, workload * h_wl, uint64_t thd_id) {
 //		aggregate_pred_vector[i] = 0;
 #elif LOG_ALGORITHM == LOG_TAURUS
 	thread_local_counter = 0; // local counter
-	partition_accesses_cnt = (uint64_t *) MALLOC(sizeof(uint64_t)*g_num_logger, GET_THD_ID);
-	memset(partition_accesses_cnt, 0, sizeof(uint64_t) * g_num_logger);
-
-	#if UPDATE_SIMD && MAX_LOGGER_NUM_SIMD==16 // we allocate a fixed size LSN
-	//if(g_num_logger < MAX_LOGGER_NUM_SIMD)
+	if(g_num_logger < 4)
 	{
 		// for SIMD
-		lsn_vector = (lsnType*) MALLOC(sizeof(lsnType) * MAX_LOGGER_NUM_SIMD, GET_THD_ID);
-		memset(lsn_vector, 0, sizeof(lsnType) * MAX_LOGGER_NUM_SIMD); // initialize to 0
+		lsn_vector = (lsnType*) _mm_malloc(sizeof(lsnType) * 4, ALIGN_SIZE);
+		memset(lsn_vector, 0, sizeof(lsnType) * 4); // initialize to 0
 	}
-	#else
+	else
 	{
-		lsn_vector = (lsnType*) MALLOC(sizeof(lsnType) * g_num_logger, GET_THD_ID);
+		lsn_vector = (lsnType*) _mm_malloc(sizeof(lsnType) * g_num_logger, ALIGN_SIZE);
 		memset(lsn_vector, 0, sizeof(lsnType) * g_num_logger); // initialize to 0
 	}	
-	#endif
 #endif
-#if LOG_ALGORITHM == LOG_PLOVER
-	_log_entry_sizes = (uint32_t *)MALLOC(sizeof(uint32_t) * g_num_logger, GET_THD_ID);
-	memset(_log_entry_sizes, 0, sizeof(uint32_t) * g_num_logger);
-	_log_entries = (char **) MALLOC(sizeof(char*) * g_num_logger, GET_THD_ID);
-	for(uint32_t i=0; i<g_num_logger; i++)
-	{
-		_log_entries[i] = (char*) numa_alloc_onnode(g_max_log_entry_size, (GET_THD_ID % g_num_logger) % NUMA_NODE_NUM);
-		//_log_entries[i] = (char*) MALLOC(g_max_log_entry_size, GET_THD_ID);
-	}
-	_targets = (uint64_t*) MALLOC(sizeof(uint64_t) * g_num_logger, GET_THD_ID);
-	// we initialize targets everytime we access it.
-	//memset(targets, 0, sizeof(uint32_t) * g_num_logger);
-#else
-	//_log_entry = new char [g_max_log_entry_size];
-	_log_entry = (char*) numa_alloc_onnode(g_max_log_entry_size, (GET_THD_ID % g_num_logger + 1) % NUMA_NODE_NUM);
+	_log_entry = new char [g_max_log_entry_size];
 	_log_entry_size = 0;
-	
-#endif
 	
 	_txn_state_queue = new queue<TxnState>;
 #if LOG_ALGORITHM == LOG_TAURUS
 	if (g_log_recover) return; // no need for queue_lsn_buffer.
 	// create a LSN buffer according to the log buffer size
 	
-	queue_lsn_vec_buffer = (lsnType*) MALLOC(g_queue_buffer_length, GET_THD_ID);
-	queue_lsn_vec_buffer_length = g_queue_buffer_length / g_num_logger / sizeof(lsnType);
+	queue_lsn_vec_buffer = (uint64_t*) _mm_malloc(g_queue_buffer_length, ALIGN_SIZE);
+	queue_lsn_vec_buffer_length = g_queue_buffer_length / g_num_logger / sizeof(uint64_t);
 	queue_lsn_vec_counter = 0;
 #endif
 	
@@ -186,7 +176,43 @@ ts_t txn_man::get_ts() {
 
 RC txn_man::cleanup(RC in_rc) 
 {
+	if(g_log_recover) return in_rc;
 	RC rc = in_rc;
+
+#if TPCC_FULL
+	assert(CC_ALG==NO_WAIT);
+	if(rc==RCOK) {
+		// trick from silo: we re-scan to avoid phantoms
+		// with 2pl, we only need to record the count.
+#if TPCC_PHANTOM_AVOIDANCE && TPCC_PHANTOM_AVOIDANCE_ALG == PHANTOM_SILO
+		// or we can do lock-based phantom avoidance
+		for (uint32_t i=0; i<scan_cnt; i++)
+		{
+			ScanHistory & sh = scan_results[i];
+			ORDERED_INDEX* idx = sh.idx;
+			row_t * rows[sh.row_count];
+			uint64_t count = sh.row_count;
+			RC idx_rc;
+			if(sh.rev)
+			{
+				idx_rc = idx->index_read_range_rev(this, sh.key, sh.max_key, rows, count, sh.part_id);
+			}
+			else
+			{
+				idx_rc = idx->index_read_range(this, sh.key, sh.max_key, rows, count, sh.part_id);
+			}
+			if(idx_rc!=RCOK || count != sh.row_count)
+			{
+				rc = Abort;
+				break;
+			}
+		}
+		if(rc==Abort)
+			INC_INT_STATS(int_scan_abort, 1);
+#endif
+	}
+#endif
+
 #if LOG_ALGORITHM == LOG_TAURUS && CC_ALG != SILO // already logged in silo_validate
 	// Start logging
 	// uint64_t & max_lsn = _max_lsn;
@@ -215,37 +241,8 @@ RC txn_man::cleanup(RC in_rc)
 				INC_INT_STATS(int_nonzero, 1);
 		}
 #endif
-#if PARTITION_AWARE
-		uint64_t partition_max_access = 0;
-		uint64_t max_access_count = 0;
-		target_logger_id = 0; // GET_THD_ID % g_num_logger;
-		for(uint32_t i=0; i<g_num_logger; i++)
-			if(partition_accesses_cnt[i] > partition_max_access)
-			{
-				partition_max_access = partition_accesses_cnt[i];
-				//target_logger_id = i;
-				max_access_count = 1;
-			}
-			else if(partition_accesses_cnt[i] == partition_max_access)
-			{
-				max_access_count ++;
-			}
-		// among all the ties, choose by random
-		uint64_t target_id = GET_THD_ID % max_access_count;
-		for(uint32_t i=0; i<g_num_logger; i++)
-			if(partition_accesses_cnt[i] == partition_max_access)
-			{
-				if(target_id==0)
-				{
-					target_logger_id = i;
-					break;
-				}
-				target_id--;
-			}
-		log_manager->serialLogTxn(_log_entry, _log_entry_size, lsn_vector, target_logger_id);  // add to buffer
-#else
-		log_manager->serialLogTxn(_log_entry, _log_entry_size, lsn_vector, GET_THD_ID % g_num_logger);  // add to buffer
-#endif
+		log_manager->serialLogTxn(_log_entry, _log_entry_size, lsn_vector);  // add to buffer
+
 		INC_INT_STATS(time_log_serialLogTxn, get_sys_clock() - current_time2);
 		INC_INT_STATS(time_log_create, current_time2 - current_time);
 	}
@@ -256,102 +253,13 @@ RC txn_man::cleanup(RC in_rc)
 		create_log_entry();
 		uint64_t current_time2 = get_sys_clock();
 		_cur_tid = log_manager->serialLogTxn(_log_entry, _log_entry_size);
+		//printf("[%lu] logged with %lu inserts at lsn %lu\n", get_thd_id(), insert_cnt, _cur_tid);
 		INC_INT_STATS(time_log_serialLogTxn, get_sys_clock() - current_time2);
 		INC_INT_STATS(time_log_create, current_time2 - current_time);
 	}
-#elif LOG_ALGORITHM == LOG_PLOVER
-	uint64_t gsn = 0;
-	if(wr_cnt > 0 && rc == RCOK)
-	{
-		uint64_t current_time = get_sys_clock();
-		create_log_entry();
-		uint64_t current_time2 = get_sys_clock();
-		
-		// targets are set in create_log_entry
-		//memset(targets, 0, sizeof(uint64_t) * g_num_logger);
-		
-		uint32_t log_id;
-		for (log_id = 0; log_id < g_num_logger; log_id ++)
-		{
-			if(_targets[log_id])
-			{
-				uint64_t * ptr_lgsn = log_manager->lgsn[log_id];
-				uint64_t local_lgsn = *ptr_lgsn;
-#if PLOVER_NO_WAIT
-				if(local_lgsn & LOCK_BIT)
-				{
-					rc = Abort;
-					break;
-				}
-				while(!ATOM_CAS(*ptr_lgsn, local_lgsn, local_lgsn | LOCK_BIT))
-				{
-					PAUSE;
-					local_lgsn = *ptr_lgsn;
-					if(local_lgsn & LOCK_BIT)
-					{
-						rc = Abort;
-						break;
-					}
-				}
-				if(rc==Abort) break;
-#else
-				// wait for the lock
-				while((local_lgsn & LOCK_BIT)!=0 || !ATOM_CAS(*ptr_lgsn, local_lgsn, local_lgsn | LOCK_BIT))
-				{
-					PAUSE;
-					local_lgsn = *ptr_lgsn;
-				}
-#endif
-				// already have the latch
-				uint64_t t_lgsn = local_lgsn & (~LOCK_BIT);
-				if(t_lgsn > gsn) gsn = t_lgsn;
-			}
-		}
-
-		if(rc==RCOK)
-		{
-			gsn++; // gsn = max{lgsn} + 1
-			bool first_log_record = true; // easier for recovery worker to count transactions
-			for(uint32_t i=0; i<g_num_logger; i++)
-				if(_targets[i])
-				{
-					assert(*log_manager->lgsn[i] & LOCK_BIT);
-					if(UNLIKELY(first_log_record))
-					{
-						first_log_record = false;
-						log_manager->serialLogTxn(_log_entries[i], _log_entry_sizes[i], gsn|LOCK_BIT, i);
-						INC_INT_STATS(num_log_records, 1);
-					}
-					else
-					{
-						log_manager->serialLogTxn(_log_entries[i], _log_entry_sizes[i], gsn, i);
-					}
-				}
-			INC_INT_STATS(time_log_serialLogTxn, get_sys_clock() - current_time2);
-			INC_INT_STATS(time_log_create, current_time2 - current_time);
-			// update and release the latches
-			for (int l2 = g_num_logger-1; l2 >= 0; l2 --)
-				if(_targets[l2])
-				{
-					uint64_t * ptr_lgsn = log_manager->lgsn[l2];
-					*ptr_lgsn = gsn;
-				}
-		}
-		else
-		{
-			// release only
-			for (int l2 = log_id - 1; l2 >= 0; l2 --)
-				if(_targets[l2])
-				{
-					uint64_t * ptr_lgsn = log_manager->lgsn[l2];
-					assert(*ptr_lgsn & LOCK_BIT); // already locked
-					*ptr_lgsn = *ptr_lgsn & (~LOCK_BIT);
-				}
-			
-		}
-	}
 #endif
 	uint64_t starttime = get_sys_clock();
+
 	// start to release the locks
 #if CC_ALG != SILO // updating the data is already handled in silo_validate
 	for (int rid = row_cnt - 1; rid >= 0; rid --) {
@@ -390,7 +298,7 @@ RC txn_man::cleanup(RC in_rc)
 		#endif
 		INC_INT_STATS(time_locktable_release, get_sys_clock() - current_time);
 #else
-		orig_r->return_row(type, this, newdata, rc);
+		orig_r->return_row(type, this, newdata);
 #endif
 #if CC_ALG != TICTOC && CC_ALG != SILO
 		accesses[rid]->data = NULL;  // will not need this any more
@@ -408,12 +316,20 @@ RC txn_man::cleanup(RC in_rc)
 	if (rc == Abort) { // remove inserted rows.
 		for (UInt32 i = 0; i < insert_cnt; i ++) {
 			row_t * row = insert_rows[i];
+#if CC_ALG == WAIT_DIE || CC_ALG == NO_WAIT || CC_ALG == DL_DETECT
+			// we bypass the lock table here
+			//auto rc = row->manager->lock_release(this);
+      		//assert(rc == RCOK);
+#else
+			assert(false); // not implemented for silo
+#endif
 			assert(g_part_alloc == false);
 #if CC_ALG != HSTORE && CC_ALG != OCC
 			mem_allocator.free(row->manager, 0);
 #endif
-			row->free_row();
-			mem_allocator.free(row, sizeof(row));
+			row->free_row(); // we only free the data
+			row->is_deleted = 1;
+			//mem_allocator.free(row, sizeof(row));
 		}
 	}
 	uint64_t cleanup_1_end = get_sys_clock();
@@ -427,15 +343,15 @@ RC txn_man::cleanup(RC in_rc)
 	    {
 			uint64_t before_log_time = get_sys_clock();
 			//uint32_t size = _log_entry_size;
+			assert(_log_entry_size != 0);
   #if LOG_ALGORITHM == LOG_TAURUS
-  			assert(_log_entry_size != 0);
 			// for waiting for txn to flush and not spinning around
 			queue<TxnState> * state_queue = _txn_state_queue; //[GET_THD_ID];
 			TxnState state;
 			++ queue_lsn_vec_counter;
 			if(queue_lsn_vec_counter == queue_lsn_vec_buffer_length) queue_lsn_vec_counter = 0;
 			state.lsn_vec = queue_lsn_vec_buffer + g_num_logger * queue_lsn_vec_counter;
-			//state.lsn_vec = (uint64_t*) MALLOC( sizeof(uint64_t) * g_num_logger, GET_THD_ID);
+			//state.lsn_vec = (uint64_t*) _mm_malloc( sizeof(uint64_t) * g_num_logger, ALIGN_SIZE);
 			//COMPILER_BARRIER
 			//INC_INT_STATS(time_state_malloc, get_sys_clock() - before_log_time);
 
@@ -449,14 +365,7 @@ RC txn_man::cleanup(RC in_rc)
 			
 			state_queue->push(state);
 			//log_manager[state.destination]->logTxn
-  #elif LOG_ALGORITHM == LOG_PLOVER
-			// plover does not need async commit if we relax the min_pgsn requirement
-			queue<TxnState> * state_queue = _txn_state_queue;
-			TxnState state;
-			state.gsn = gsn;
-			state.start_time = _txn_start_time;
-			state.wait_start_time = get_sys_clock();
-			state_queue->push(state);
+			
   #elif LOG_ALGORITHM == LOG_SERIAL
 			//	_max_lsn: max LSN for predecessors
 			//  _cur_tid: LSN for the log record of the current txn 
@@ -468,7 +377,7 @@ RC txn_man::cleanup(RC in_rc)
 				state.start_time = _txn_start_time;
 				state.wait_start_time = get_sys_clock();
 				state_queue->push(state);
-			//}
+			
   #elif LOG_ALGORITHM == LOG_PARALLEL
 			bool success = true;
 			// check own log record  
@@ -499,8 +408,8 @@ RC txn_man::cleanup(RC in_rc)
 				} 		
 			}
 			if (success) { 
-				INC_INT_STATS_V0(num_latency_count, 1);
-				INC_FLOAT_STATS_V0(latency, get_sys_clock() - _txn_start_time);
+				INC_INT_STATS(num_latency_count, 1);
+				INC_FLOAT_STATS(latency, get_sys_clock() - _txn_start_time);
 			} else {
 				queue<TxnState> * state_queue = _txn_state_queue; // [GET_THD_ID];
 				TxnState state;
@@ -540,8 +449,8 @@ RC txn_man::cleanup(RC in_rc)
 			}
 			//printf("flushed_epoch= %ld\n", flushed_epoch);
 			if (_epoch <= flushed_epoch) {
-				INC_INT_STATS_V0(num_latency_count, 1);
-				INC_FLOAT_STATS_V0(latency, get_sys_clock() - _txn_start_time);
+				INC_INT_STATS(num_latency_count, 1);
+				INC_FLOAT_STATS(latency, get_sys_clock() - _txn_start_time);
 			} else {
 				queue<TxnState> * state_queue = _txn_state_queue; //[GET_THD_ID];
 				TxnState state;
@@ -560,18 +469,20 @@ RC txn_man::cleanup(RC in_rc)
 	try_commit_txn();  // no need to try_commit_txn if abort
 #else // LOG_ALGORITHM == LOG_NO
 	uint64_t cleanup2_begin = get_sys_clock();
-	INC_INT_STATS_V0(num_latency_count, 1);
-	INC_FLOAT_STATS_V0(latency, get_sys_clock() - _txn_start_time);
+	INC_INT_STATS(num_latency_count, 1);
+	INC_FLOAT_STATS(latency, get_sys_clock() - _txn_start_time);
 #endif
-
-#if LOG_ALGORITHM == LOG_PLOVER
-	memset(_log_entry_sizes, 0, sizeof(uint32_t) * g_num_logger);
-#else
+	
 	_log_entry_size = 0;
-#endif
 	row_cnt = 0;
 	wr_cnt = 0;
 	insert_cnt = 0;
+	remove_cnt = 0;
+	insert_idx_cnt = 0;
+	remove_idx_cnt = 0;
+	scan_cnt = 0;
+	node_map.clear();
+
 #if LOG_ALGORITHM == LOG_PARALLEL
 	_num_raw_preds = 0;
 	_num_waw_preds = 0;
@@ -579,7 +490,6 @@ RC txn_man::cleanup(RC in_rc)
 	_max_lsn = 0;
 #elif LOG_ALGORITHM == LOG_TAURUS
 	_max_lsn = 0;
-	memset(partition_accesses_cnt, 0, sizeof(uint64_t) * g_num_logger);
 	memset(lsn_vector, 0, sizeof(lsnType) * g_num_logger);
 #endif
 #if CC_ALG == DL_DETECT
@@ -606,9 +516,8 @@ txn_man::try_commit_txn()
 		}
 		if (success) {
 			uint64_t lat = get_sys_clock() - state.start_time;
-			INC_FLOAT_STATS_V0(latency, lat);
-			INC_INT_STATS_V0(num_latency_count, 1);
-			INC_INT_STATS(num_async_commits, 1);
+			INC_FLOAT_STATS(latency, lat);
+			INC_INT_STATS(num_latency_count, 1);
 			state_queue->pop();
 		}
 	}
@@ -632,30 +541,9 @@ txn_man::try_commit_txn()
 		}
 		if (success) {
 			uint64_t lat = get_sys_clock() - state.start_time;
-			INC_FLOAT_STATS_V0(latency, lat);
-			INC_INT_STATS_V0(num_latency_count, 1);
-			INC_INT_STATS(num_async_commits, 1);
+			INC_FLOAT_STATS(latency, lat);
+			INC_INT_STATS(num_latency_count, 1);
 			//_mm_free(state.lsn_vec);
-			state_queue->pop();
-		}
-	}
-#elif LOG_ALGORITHM == LOG_PLOVER
-	bool success = true;
-	queue<TxnState> * state_queue = _txn_state_queue; //[GET_THD_ID];
-	while(!state_queue->empty() && success)
-	{
-		TxnState state = state_queue->front();
-		for (uint32_t i=0; i < g_num_logger; i++)  {
-			if(state.gsn > log_manager->pgsn[i][0])
-			{
-				success = false;
-				break;
-			}
-		}
-		if (success) {
-			INC_INT_STATS_V0(num_latency_count, 1);
-			INC_FLOAT_STATS_V0(latency, get_sys_clock() - state.start_time);
-			INC_INT_STATS(num_async_commits, 1);
 			state_queue->pop();
 		}
 	}
@@ -672,9 +560,8 @@ txn_man::try_commit_txn()
 			}
 		}
 		if (success) {
-			INC_INT_STATS_V0(num_latency_count, 1);
-			INC_FLOAT_STATS_V0(latency, get_sys_clock() - state.start_time);
-			INC_INT_STATS(num_async_commits, 1);
+			INC_INT_STATS(num_latency_count, 1);
+			INC_FLOAT_STATS(latency, get_sys_clock() - state.start_time);
 			state_queue->pop();
 		}
 	}
@@ -695,9 +582,8 @@ txn_man::try_commit_txn()
 			break;
 		}
 		if (success) {
-			INC_INT_STATS_V0(num_latency_count, 1);
-			INC_FLOAT_STATS_V0(latency, get_sys_clock() - state.start_time);
-			INC_INT_STATS(num_async_commits, 1);
+			INC_INT_STATS(num_latency_count, 1);
+			INC_FLOAT_STATS(latency, get_sys_clock() - state.start_time);
 			state_queue->pop();
 		}
 	}
@@ -705,6 +591,12 @@ txn_man::try_commit_txn()
 	INC_INT_STATS(time_debug5, get_sys_clock() - starttime);
 }
 
+row_t * txn_man::get_row(row_t *row, access_t type){
+	char * temp;
+	auto ret = get_row(row, type, temp);
+	if (ret != RCOK) return NULL;
+	return row;
+}
 
 RC txn_man::get_row(row_t * row, access_t type, char * &data) { //TODO: change this function so that it aquires the Locktable
 	// NOTE. 
@@ -722,7 +614,7 @@ RC txn_man::get_row(row_t * row, access_t type, char * &data) { //TODO: change t
 	RC rc = RCOK;
 	if (row_cnt == num_accesses_alloc) {
 		// accesses[row_cnt] == NULL // bad 
-		Access * access = (Access *) MALLOC(sizeof(Access), GET_THD_ID);
+		Access * access = (Access *) _mm_malloc(sizeof(Access), ALIGN_SIZE);
 		accesses[row_cnt] = access;
 
 #if (CC_ALG == SILO || CC_ALG == TICTOC)
@@ -733,14 +625,20 @@ RC txn_man::get_row(row_t * row, access_t type, char * &data) { //TODO: change t
 		access->orig_data = NULL;
 //#endif
 #elif (CC_ALG == DL_DETECT || CC_ALG == NO_WAIT || CC_ALG == WAIT_DIE)
-		accesses[row_cnt]->orig_data = (char*)MALLOC(sizeof(row_t), GET_THD_ID);
-		((row_t *)(accesses[row_cnt]->orig_data))->init(MAX_TUPLE_SIZE);	
+		access->orig_data = (char*)_mm_malloc(sizeof(row_t), ALIGN_SIZE);
+		((row_t *)(access->orig_data))->init(MAX_TUPLE_SIZE);
 #endif
-		
 		num_accesses_alloc ++;
+#if WORKLOAD == TPCC
+		if(num_accesses_alloc > MAX_ROW_PER_TXN)
+		{
+			cout << "MAX_ROW_PER_TXN violation " << MAX_ROW_PER_TXN << endl;
+			assert(false);
+		}
+#endif
 	}
 	uint64_t right_before_get = get_sys_clock();
-	INC_INT_STATS_V0(time_get_row_before, right_before_get - starttime);
+	INC_INT_STATS(time_get_row_before, right_before_get - starttime);
 	//if(row_cnt == 19)
 	//	printf("Encounter 19, before get_row as %" PRIu64 ", type %d\n", (uint64_t)row, type);
 #if USE_LOCKTABLE && CC_ALG != SILO
@@ -757,13 +655,8 @@ RC txn_man::get_row(row_t * row, access_t type, char * &data) { //TODO: change t
 #else
 	rc = row->get_row(type, this, accesses[ row_cnt ]->data);
 #endif
-
-#if LOG_ALGORITHM == LOG_TAURUS
-	partition_accesses_cnt[logPartition((uint64_t)row)] ++;
-#endif
-
-	uint64_t starttime2 = get_sys_clock();
-	INC_INT_STATS_V0(time_locktable_get, starttime2 - right_before_get);
+	starttime = get_sys_clock();
+	INC_INT_STATS(time_locktable_get, starttime - right_before_get);
 	
 	if (rc == Abort) {
 		return Abort;
@@ -785,7 +678,6 @@ RC txn_man::get_row(row_t * row, access_t type, char * &data) { //TODO: change t
 	// orig_data should be char *
 	// assert(false);
 	if (type == WR) {
-		
 		((row_t *)(accesses[row_cnt]->orig_data))->table = row->get_table();
 		((row_t *)(accesses[row_cnt]->orig_data))->copy(row);
 	}
@@ -802,39 +694,112 @@ RC txn_man::get_row(row_t * row, access_t type, char * &data) { //TODO: change t
 		write_set[wr_cnt] = row_cnt;
 		wr_cnt ++;
 	}
-	uint64_t timespan = get_sys_clock() - starttime;
-	INC_INT_STATS_V0(time_get_row_after, get_sys_clock() - starttime2);
-	INC_INT_STATS(time_man, timespan);
+	//uint64_t timespan = get_sys_clock() - starttime;
+	INC_INT_STATS(time_get_row_after, get_sys_clock() - starttime);
+	//INC_INT_STATS(time_man, timespan);
 	data = accesses[row_cnt]->data;
 	row_cnt ++;  // moved 
 	return RCOK;
 }
 
-void txn_man::insert_row(row_t * row, table_t * table) {
-	if (CC_ALG == HSTORE)
-		return;
-	assert(insert_cnt < MAX_ROW_PER_TXN);
-	insert_rows[insert_cnt ++] = row;
-}
-
+template <typename IndexT>
 itemid_t *
-txn_man::index_read(INDEX * index, idx_key_t key, int part_id) {
+txn_man::index_read(IndexT * index, idx_key_t key, int part_id) {
 itemid_t * item;
-	uint64_t starttime = get_sys_clock();
 	index->index_read(key, item, part_id, get_thd_id());
-	INC_INT_STATS(time_index, get_sys_clock() - starttime);
 	return item;
 }
 
-void 
-txn_man::index_read(INDEX * index, idx_key_t key, int part_id, itemid_t *& item) {
-	uint64_t starttime = get_sys_clock();
-	index->index_read(key, item, part_id, get_thd_id());
-	INC_INT_STATS(time_index, get_sys_clock() - starttime);
+template <typename IndexT>
+RC
+txn_man::index_read(IndexT* index, idx_key_t key, row_t** row, int part_id) {
+	return index->index_read(this, key, row, part_id);
+}
+
+template <typename IndexT>
+RC
+txn_man::index_read_multiple(IndexT* index, idx_key_t key, row_t** rows, size_t& count, int part_id) {
+	return index->index_read_multiple(this, key, rows, count, part_id);
+}
+
+template <typename IndexT>
+row_t* txn_man::search(IndexT* index, uint64_t key, int part_id, access_t type, bool skip_read) {
+	row_t* row;
+  	auto ret = index_read(index, key, &row, part_id);
+	if (ret != RCOK) return NULL;
+	
+	if(skip_read && type==RD) return row;
+
+	char* data;
+	auto rc = get_row(row, type, data); // trace the read/write
+	if(rc!=RCOK) return NULL;
+  	
+	return row;
+}
+
+template <typename IndexT>
+RC
+txn_man::index_read_range(IndexT* index, idx_key_t min_key, idx_key_t max_key, row_t** rows, size_t& count, int part_id) {
+	if(g_log_recover)
+	{
+		auto rc = index->index_read_range(this, min_key, max_key, rows, count, part_id);
+		return rc;
+	}
+
+	auto rc = index->index_read_range(this, min_key, max_key, rows, count, part_id);
+
+	if(rc!=RCOK) return rc;
+
+#if TPCC_PHANTOM_AVOIDANCE && TPCC_PHANTOM_AVOIDANCE_ALG == PHANTOM_SILO
+	if(scan_cnt == MAX_SCAN_PER_TXN) assert(false);
+	scan_results[scan_cnt].idx = (ORDERED_INDEX*)index;
+	scan_results[scan_cnt].key = min_key;
+	scan_results[scan_cnt].max_key = max_key;
+	scan_results[scan_cnt].part_id = part_id;
+	scan_results[scan_cnt].rev = false;
+	
+	scan_results[scan_cnt].row_count = count;
+	scan_cnt ++;
+#endif
+#if TPCC_PHANTOM_AVOIDANCE && TPCC_PHANTOM_AVOIDANCE_ALG == PHANTOM_LOCK
+	char* tmpdata;
+	rc = get_row(index->table->tablewise_lock, RD, tmpdata);
+#endif
+
+	return rc;
+}
+
+template <typename IndexT>
+RC
+txn_man::index_read_range_rev(IndexT* index, idx_key_t min_key, idx_key_t max_key, row_t** rows, size_t& count, int part_id) {
+	if(g_log_recover)
+	{
+		auto rc = index->index_read_range_rev(this, min_key, max_key, rows, count, part_id);
+		return rc;
+	}
+	auto rc = index->index_read_range_rev(this, min_key, max_key, rows, count, part_id);
+
+	if(rc!=RCOK) return rc;
+
+#if TPCC_PHANTOM_AVOIDANCE && TPCC_PHANTOM_AVOIDANCE_ALG == PHANTOM_SILO
+	if(scan_cnt == MAX_SCAN_PER_TXN) assert(false);
+	scan_results[scan_cnt].idx = (ORDERED_INDEX*)index;
+	scan_results[scan_cnt].key = min_key;
+	scan_results[scan_cnt].max_key = max_key;
+	scan_results[scan_cnt].part_id = part_id;
+	scan_results[scan_cnt].rev = true;	
+	scan_results[scan_cnt].row_count = count;
+	scan_cnt ++;
+#endif
+#if TPCC_PHANTOM_AVOIDANCE && TPCC_PHANTOM_AVOIDANCE_ALG == PHANTOM_LOCK
+	char* tmpdata;
+	rc = get_row(index->table->tablewise_lock, RD, tmpdata);
+#endif
+	return rc;
 }
 
 RC txn_man::finish(RC rc) {
-	assert(!g_log_recover);
+	
 #if CC_ALG == HSTORE
 	return RCOK;
 #endif
@@ -847,31 +812,126 @@ RC txn_man::finish(RC rc) {
 #elif CC_ALG == TICTOC
 	if (rc == RCOK) {
 		rc = validate_tictoc();
-	} else  {
+	} else 
 		rc = cleanup(rc);
-	}
 #elif CC_ALG == SILO
 	if (rc == RCOK)
-	{
 	#if LOG_ALGORITHM == LOG_SERIAL
 		rc = validate_silo_serial();
 	#else
 		rc = validate_silo();
 	#endif
-	}
-	else
-	{ 
+	else 
 		cleanup(rc);
-	}
 #elif CC_ALG == HEKATON
 	rc = validate_hekaton(rc);
 	cleanup(rc);
 #else // lock-based
-	rc = cleanup(rc);  // PLOVER could abort a transaction during cleanup
+	rc = apply_index_changes(rc);
+	if(rc!=RCOK) INC_INT_STATS(int_apply_index_change_abort, 1);
+	cleanup(rc);
 #endif
 	uint64_t timespan = get_sys_clock() - starttime;
-	INC_INT_STATS(time_man, timespan);
+	//INC_INT_STATS(time_man, timespan);
 	INC_INT_STATS(time_cleanup,  timespan);
+	return rc;
+}
+
+
+RC txn_man::apply_index_changes(RC rc) {
+#if RCU_ALLOC
+  assert(rcu::s_instance.in_rcu_region());
+#endif
+
+#if !SIMPLE_INDEX_UPDATE
+  if (rc == RCOK) rc = ORDERED_INDEX::validate(this);
+
+  if (rc != RCOK) {
+    // Remove previously inserted placeholders.
+    for (size_t i = 0; i < insert_idx_cnt; i++) {
+      auto idx = insert_idx_idx[i];
+      auto key = insert_idx_key[i];
+      // auto row = insert_idx_row[i];
+      auto part_id = insert_idx_part_id[i];
+
+      auto rc_remove = idx->index_remove(this, key, NULL, part_id);
+
+      assert(rc_remove == RCOK);
+    }
+    //insert_idx_cnt = 0;
+    return rc;
+  }
+#else
+  if (rc != RCOK) return rc;
+#endif  // SIMPLE_INDEX_UPDATE
+
+#if SIMPLE_INDEX_UPDATE
+  for (size_t i = 0; i < insert_idx_cnt; i++) {
+    auto idx = insert_idx_idx[i];
+    auto key = insert_idx_key[i];
+    auto row = insert_idx_row[i];
+    auto part_id = insert_idx_part_id[i];
+
+    // printf("insert_idx idx=%p key=%" PRIu64 " part_id=%d\n", idx, key, part_id);
+
+    auto rc_insert = idx->index_insert(this, key, row, part_id);
+
+
+    if (rc_insert != RCOK) {
+      // Remove previously inserted entries.
+      while (i > 0) {
+        i--;
+        auto idx = insert_idx_idx[i];
+        auto key = insert_idx_key[i];
+        // auto row = insert_idx_row[i];
+        auto part_id = insert_idx_part_id[i];
+
+        auto rc_remove = idx->index_remove(this, key, NULL, part_id);
+
+        assert(rc_remove == RCOK);
+      }
+      //insert_idx_cnt = 0;
+      return Abort;
+    }
+  }
+#endif  // SIMPLE_INDEX_UPDATE
+  //insert_idx_cnt = 0;
+
+	for (size_t i = 0; i < remove_idx_cnt; i++) {
+		auto idx = remove_idx_idx[i];
+		auto key = remove_idx_key[i];
+		auto part_id = remove_idx_part_id[i];
+    	//printf("remove_idx idx=%p key=%" PRIu64 " part_id=%d\n", idx, key, part_id);
+
+		auto rc_remove = idx->index_remove(this, key, NULL, part_id);
+		assert(rc_remove==RCOK);
+		// other transactions could remove the same row.
+//#if TPCC_PHANTOM_AVOIDANCE
+		// if(rc_remove != RCOK) return Abort;
+//#endif
+	}
+	//remove_idx_cnt = 0;
+
+	// Free deleted rows
+	for (size_t i = 0; i < remove_cnt; i++) {
+		auto row = remove_rows[i];
+//#if TPCC_PHANTOM_AVOIDANCE
+		assert(!row->is_deleted);
+//#endif
+		row->is_deleted = 1;
+		// printf("remove_row row_id=%" PRIu64 " part_id=%" PRIu64 "\n", row->get_row_id(), row->get_part_id());
+		// XXX: Freeing the row immediately is unsafe due to concurrent access.
+		// We do this only when using RCU.
+	  if (RCU_ALLOC) mem_allocator.free(row, row_t::alloc_size(row->get_table()));
+		// XXX: We need to perform the following to free up all the resources
+// #if CC_ALG != HSTORE && CC_ALG != OCC && CC_ALG != MICA && !defined(USE_INLINED_DATA)
+// 			// XXX: Need to find the manager size.
+// 			mem_allocator.free(row->manager, 0);
+// #endif
+// 			row->free_row();
+	}
+	//remove_cnt = 0;
+
 	return rc;
 }
 
@@ -880,8 +940,8 @@ txn_man::release() {
 	for (uint32_t i = 0; i < num_accesses_alloc; i++)
 	{
 #if ROLL_BACK && (CC_ALG == DL_DETECT || CC_ALG == NO_WAIT || CC_ALG == WAIT_DIE)
-		FREE(((row_t*)accesses[i]->orig_data)->data, sizeof(char) * ((row_t*)accesses[i]->orig_data)->get_tuple_size());
-		FREE(accesses[i]->orig_data, sizeof(row_t));
+		_mm_free(((row_t*)accesses[i]->orig_data)->data);
+		_mm_free(accesses[i]->orig_data);
 #endif // otherwise orig_data is NULL
 		mem_allocator.free(accesses[i], 0);
 	}
@@ -898,7 +958,7 @@ txn_man::recover() {
 #elif LOG_ALGORITHM == LOG_BATCH
 	batch_recover();
 #elif LOG_ALGORITHM == LOG_TAURUS
-	if(!PER_WORKER_RECOVERY && g_zipf_theta >= CONTENTION_THRESHOLD)
+	if(g_zipf_theta >= CONTENTION_THRESHOLD)
 	{
 		taurus_recover_high_contention();
 	}
@@ -906,8 +966,6 @@ txn_man::recover() {
 	{
 		taurus_recover();
 	}
-#elif LOG_ALGORITHM == LOG_PLOVER
-	plover_recover();
 #endif
 }
 
@@ -926,9 +984,13 @@ void printPI(LoggingThread::poolItem & pi)
 void printPool(uint64_t index) {
 	uint32_t logger = GET_THD_ID % g_num_logger;
 	LoggingThread *lt = logging_thds[logger];
-	
+	//list<LoggingThread::poolItem> *pool = lt->pool;
+	//LoggingThread::poolItem * it = lt->pool;
+	//poolItem * tail = lt->tail;
+	//uint64_t counter = 0;
+	//cout << "pool size " << pool->size() << endl;
 	cout << "pool size " << lt->poolsize << endl;
-	
+	//for(auto it = pool->begin(); it != pool->end(); it++)
 	printPI(lt->pool[index]);
 }
 #endif
@@ -953,7 +1015,7 @@ void txn_man::taurus_recover_high_contention() {
     uint64_t *LVFence[g_num_logger];
     for(uint i=0; i<g_num_logger; i++)
     {
-        LVFence[i] = (uint64_t*) MALLOC(sizeof(uint64_t) * g_num_logger, GET_THD_ID);
+        LVFence[i] = (uint64_t*) _mm_malloc(sizeof(uint64_t) * g_num_logger, ALIGN_SIZE);
 		memset(LVFence[i], 0, sizeof(uint64_t) * g_num_logger);
     }
 #endif
@@ -973,21 +1035,7 @@ void txn_man::taurus_recover_high_contention() {
 		if(lt[realLogId]->poolDone)
 		{
 			if(*poolEnd[realLogId]<=*poolStart[realLogId])
-			{
-				uint32_t i;
-				for(i=0; i< g_num_logger; i++)
-				{
-					if(!lt[i]->poolDone || *poolEnd[i]>*poolStart[i])
-					{
-						break;
-					}
-				}
-				if(i==g_num_logger) // every logger is finished.
 					break;
-				*log_manager->recoverLVSPSC[realLogId][0] = UINT64_MAX;
-				// mark this log as done
-				realLogId = (realLogId + 1) % g_num_logger;
-			}
 		}
 		//if(lt->poolDone)	
 		//	cout << lt->poolDone << " " << poolStart << " " << poolEnd << endl;
@@ -1022,7 +1070,7 @@ void txn_man::taurus_recover_high_contention() {
 					memcpy(LVFence[realLogId], ptdentry + sizeof(uint32_t) * 2, sizeof(uint64_t) * g_num_logger);
 					it->recovered = 1;// No recover for PSN
 					it->rasterized = 1;
-					INC_INT_STATS_V0(int_aux_bytes, sizeof(uint64_t) * g_num_logger + sizeof(uint32_t) * 2);
+					INC_INT_STATS(int_aux_bytes, sizeof(uint64_t) * g_num_logger + sizeof(uint32_t) * 2);
 					continue;
 				}
 				else
@@ -1038,8 +1086,8 @@ void txn_man::taurus_recover_high_contention() {
 						uint64_t psnToWrite = *(uint64_t*)(ptdentry + it->size - 1 - sizeof(uint64_t) * i);
 						it->txnLV[psnToWrite&((1<<5)-1)] = psnToWrite >> 5;
 					}
-					//INC_INT_STATS_V0(int_aux_bytes, (psnCounter + 1) * sizeof(uint64_t));
-					INC_INT_STATS_V0(int_aux_bytes, psnCounter * sizeof(uint64_t) + 1);
+					//INC_INT_STATS(int_aux_bytes, (psnCounter + 1) * sizeof(uint64_t));
+					INC_INT_STATS(int_aux_bytes, psnCounter * sizeof(uint64_t) + 1);
 				}
 #else
 				// read meta_info
@@ -1048,9 +1096,9 @@ void txn_man::taurus_recover_high_contention() {
 				{
 					it->txnLV[i] = LV_start[i];
 				}
-				INC_INT_STATS_V0(int_aux_bytes, sizeof(uint64_t) * g_num_logger);
+				INC_INT_STATS(int_aux_bytes, sizeof(uint64_t) * g_num_logger);
 #endif
-				INC_INT_STATS_V0(num_log_entries, 1);
+				INC_INT_STATS(num_log_entries, 1);
 				
 				it->rasterized = 1;
 			}
@@ -1063,7 +1111,6 @@ void txn_man::taurus_recover_high_contention() {
 			{
 				//if(j<num_worker)
 				if(it->txnLV[i] > *log_manager->recoverLVSPSC[i][0])
-				//if(it->txnLV[i] > *log_manager->recoverLVSPSC_min[i])
 				{
 					realLogId = i; // solve this guy
 					break;
@@ -1082,7 +1129,7 @@ void txn_man::taurus_recover_high_contention() {
 			//cout << get_sys_clock() - it->starttime << endl;
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
-			INC_FLOAT_STATS_V0(latency, get_sys_clock() - it->starttime);
+			INC_FLOAT_STATS(latency, get_sys_clock() - it->starttime);
 #pragma GCC diagnostic pop
 			
 			//uint64_t tt4 = get_sys_clock();
@@ -1093,7 +1140,7 @@ void txn_man::taurus_recover_high_contention() {
 			//INC_INT_STATS(time_recover4, tt5 - tt4); // clean
 			realLogId = (realLogId + 1) % g_num_logger;
 			INC_INT_STATS(int_debug5, size_aligned);
-			INC_INT_STATS_V0(num_commits, 1);
+			INC_INT_STATS(num_commits, 1);
 			break;
 		}
 #if RECOVERY_FULL_THR
@@ -1109,7 +1156,12 @@ void txn_man::taurus_recover_high_contention() {
 	
 #endif
 	INC_INT_STATS(time_recover_full, get_sys_clock() - recover_full_start);
-	
+	//ATOM_ADD(lt->workerDone[0], 1);  // notify the logger.
+//#endif
+	//stringstream sstream;
+	//stats->_stats[GET_THD_ID]->_int_stats[STAT_num_latency_count] = stats->_stats[GET_THD_ID]->_int_stats[STAT_num_commits];
+	//sstream << "Recover finished for worker " << GET_THD_ID << " of logger " << realLogId << endl;
+	//cout << sstream.str(); // atomic output.
 }
 
 void txn_man::taurus_recover() {
@@ -1120,149 +1172,172 @@ void txn_man::taurus_recover() {
 	uint32_t workerId = GET_THD_ID / g_num_logger;
 	uint32_t num_worker = g_thread_cnt / g_num_logger;
 	uint64_t latestLSN = 0;
-	LoggingThread::poolItem* pool = (LoggingThread::poolItem*) MALLOC(sizeof(LoggingThread::poolItem) * g_poolsize_wait + ALIGN_SIZE, GET_THD_ID);
-
+	#if COMPRESS_LSN_LOG
+			uint64_t * LVFence = (uint64_t*) _mm_malloc(sizeof(uint64_t) * g_num_logger, ALIGN_SIZE);
+			memset(LVFence, 0, sizeof(uint64_t) * g_num_logger);
+	#endif
+	//cout << workerId << " " << logger << endl;
+	// TODO: might not accurate
+	//LoggingThread *lt = logging_thds[logger];
+	//uint32_t realLogId = logging_thds[logger]->_thd_id % g_num_logger;
+	
+	//LoggingThread::poolItem* pool = lt->SPSCPools[workerId];
+	LoggingThread::poolItem** pool = (LoggingThread::poolItem*) _mm_malloc(sizeof(LoggingThread::poolItem) * g_poolsize_wait + ALIGN_SIZE, ALIGN_SIZE);
 	for(uint32_t j=0; j<g_poolsize_wait; j++)
 	{
-#if TAURUS_CHUNK_MEMCPY
-		pool[j].txnData = (char *) MALLOC(g_max_log_entry_size, GET_THD_ID);
-		pool[j].txnLV = (uint64_t *) MALLOC(sizeof(uint64_t) * MAX_LOGGER_NUM_SIMD, GET_THD_ID);
-#else
-		pool[j].txnData = NULL;
-		pool[j].txnLV = NULL;
-#endif
-		pool[j].LSN = (uint64_t*) MALLOC(sizeof(uint64_t), GET_THD_ID);
-		pool[j].LSN[0] = 0; // this is important.
+		pool[j]->txnData = (char*) _mm_malloc(g_max_log_entry_size, ALIGN_SIZE);
+		pool[j]->txnLV = (uint64_t*) _mm_malloc(sizeof(uint64_t) * g_num_logger, ALIGN_SIZE);
+		pool[j]->LSN = (uint64_t*) _mm_malloc(sizeof(uint64_t), ALIGN_SIZE);
+		pool[j]->LSN[0] = 0; // this is important.
 	}
-	
-#if ASYNC_IO && !WORK_IN_PROGRESS
 	LoggingThread::poolItem *it;
 	assert(g_thread_cnt % g_num_logger == 0);
 	uint64_t poolStart = 0, poolEnd = 0;
 	LogManager * logger = log_manager->_logger[loggerId];
-	uint64_t file_size = 0;
-	uint64_t offset = 0;
-	uint64_t workingIndex = 0;
-	aiocb64 cb;
-	memset(&cb, 0, sizeof(aiocb64));
-	
-	uint32_t lastChunkNum = 0;
-	uint64_t lastLSN = 0;
-	uint64_t lastSize = 0;
-	uint64_t lastTime = 0;
-	bool AIOworking = false;
-	bool ready[2];
-	ready[0] = ready[1] = false;
-
-	char * buffer_base[2];
-	char * buffer_base[0] = (char*) MALLOC(logger->_chunk_size + 512, GET_THD_ID);
-	char * buffer_base[1] = (char*) MALLOC(logger->_chunk_size + 512, GET_THD_ID);
-	uint64_t tt;
-	uint64_t * rlv_cache = (uint64_t*) MALLOC(sizeof(uint64_t) * g_num_logger, GET_THD_ID);
-	memset(rlv_cache, 0, sizeof(uint64_t) * g_num_logger);
-	LoggingThread *lt = logging_thds[loggerId];
-	uint32_t chunk_num=0;
-	char * buffer = NULL;
-	uint64_t base_lsn=0;
-	while (true)
+	char * default_entry = (char*) _mm_malloc(MAX_TUPLE_SIZE, 64);
+	for(;;)
 	{
-		if (offset >= file_size && poolStart == poolEnd)
+		uint64_t lz1 = get_sys_clock();
+		uint32_t lz4;
+		char * entry = default_entry;
+		uint32_t size;
+		if(poolEnd - poolStart < g_poolsize_wait)
 		{
-			// local work is done
-			if (lastChunkNum >= log_manager[logger]->_num_chunks - 1) 
-				break; // no new chunks are coming in.
-		}
-#if TAURUS_CHUNK_MEMCPY
-		if (offset >= file_size) // memcpy is turned on
-#else
-		// acquire a new chunk when empty
-		if (offset >= file_size && poolStart == poolEnd)
+			// fill in the pool
+			bool eof = logger->iseof();
+#if RECOVERY_FULL_THR	
+	if(glob_manager->_workload->sim_done>0)
+		break; // someone has finished.
 #endif
-		{
-			// we need a new chunk
+			uint64_t lsn = logger->get_next_log_entry(entry, size);
+			uint32_t lz2 = get_sys_clock();
 			
-			base_lsn = 0;
-			tt = get_sys_clock();
-			
-			buffer = buffer_base[workingIndex];
-
-			log_manager[logger]->get_next_log_chunk(buffer, buffer_base[workingIndex^1], file_size, lastTime, cb, AIOworking, ready[workingIndex^1], lastChunkNum, lastLSN);
-
-			if (!ready[workingIndex^1])
+			INC_INT_STATS(time_recover1, lz2 - lz1);
+			//cout << lsn << " " << (uint64_t)entry << endl;
+			if(entry != NULL)
 			{
-				PAUSE
-				continue;
+				assert(*(uint32_t*)entry == 0xbeef || entry[0] == 0x7f);
+				it = pool + poolEnd % g_poolsize_wait;
+				
+				char * & ptdentry = entry;
+	#if COMPRESS_LSN_LOG
+				// read metainfo
+				if(ptdentry[0] == 0x7f)
+				{
+					// this is a PSN Flush
+					memcpy(LVFence, ptdentry + sizeof(uint32_t) * 2, sizeof(uint64_t) * g_num_logger);
+					INC_INT_STATS(int_aux_bytes, sizeof(uint64_t) * g_num_logger + sizeof(uint32_t) * 2);
+					continue; // no recovering for PSN flush
+				}
+				else
+				{
+					// use LVFence to update T.LV
+					memcpy(it->txnLV, LVFence, sizeof(uint64_t) * g_num_logger);
+					uint64_t psnCounter = *(uint64_t*)(ptdentry + size - 1); // sizeof(uint64_t));
+					psnCounter &= 0xff; // extract only one byte
+					for(uint i=1; i<=psnCounter; i++)
+					{
+						//uint64_t psnToWrite = *(uint64_t*)(ptdentry + size - sizeof(uint64_t) - sizeof(uint64_t) * i);
+						uint64_t psnToWrite = *(uint64_t*)(ptdentry + size - 1 - sizeof(uint64_t) * i);
+						it->txnLV[psnToWrite&((1<<5)-1)] = psnToWrite >> 5;
+					}
+					//INC_INT_STATS(int_aux_bytes, (psnCounter + 1) * sizeof(uint64_t));
+					INC_INT_STATS(int_aux_bytes, psnCounter * sizeof(uint64_t) + 1);
+				}
+	#else
+				// read meta_info
+				uint64_t *LV_start = (uint64_t*)(ptdentry + size - sizeof(uint64_t) * g_num_logger);
+				for(uint i=0; i<g_num_logger; i++)
+				{
+					it->txnLV[i] = LV_start[i];
+				}
+				INC_INT_STATS(int_aux_bytes, g_num_logger * sizeof(uint64_t));
+	#endif
+				INC_INT_STATS(num_log_entries, 1);
+				uint32_t lz3 = get_sys_clock();
+				INC_INT_STATS(time_recover2, lz3 - lz2);
+				uint i=0, j=0;
+				// use SIMD and manual unroll
+				//int unroll = (g_num_logger/4) * 4;
+				for(; i<g_num_logger; i++)
+				{
+					//uint64_t txnLVi_cache = it->txnLV[i];
+					if(it->txnLV[i] <= *log_manager->recoverLVSPSC_min[i])
+						continue;
+					// must be good even if it is stale
+					uint64_t recoverLV_i_min = UINT64_MAX;
+					for(j=0; j<num_worker; j++)
+					// unnecessary to be atomic.
+					// It is good to have recoverLVSPSC in a same cacheline!
+					{
+						uint64_t recoverlvspscIJ = *log_manager->recoverLVSPSC[i][j];
+						uint64_t maxlvspscIJ = *log_manager->maxLVSPSC[i][j];
+						if(maxlvspscIJ > recoverlvspscIJ && recoverLV_i_min > recoverlvspscIJ)
+							recoverLV_i_min = recoverlvspscIJ;
+						if(recoverLV_i_min > maxlvspscIJ)
+							recoverLV_i_min = maxlvspscIJ;
+							//break;
+					}
+					//INC_INT_STATS(int_debug10, 1);
+					// unnecessary to atomically update
+					*log_manager->recoverLVSPSC_min[i] = recoverLV_i_min;
+					//if(j<num_worker)
+					if(it->txnLV[i] > recoverLV_i_min)
+						break;
+				}
+				if(i<g_num_logger)
+				{
+					// not good for now, put into the pool.
+					memcpy(it->txnData, entry, size);
+					it->recovered = 0;
+					poolEnd ++;
+				}
+				else
+				{
+					// we can recover it right away
+					assert(*(uint32_t*)entry == 0xbeef || entry[0] == 0x7f);
+					recover_txn(entry + sizeof(uint32_t) * 2);
+					INC_INT_STATS(num_commits, 1);
+
+					uint32_t size_aligned = size % 64 == 0 ? size : size + 64 - size % 64;
+					INC_INT_STATS(int_debug5, size_aligned);
+				}
+				
+
+				COMPILER_BARRIER
+				//logger->rasterizedLSN[workerId][0] = lsn;
+#if PER_WORKER_RECOVERY
+				logger->reserveLSN[workerId][0] = 0;
+#endif
+
+				latestLSN = lsn;
+				lz4 = get_sys_clock();
+				INC_INT_STATS(time_recover3, lz4 - lz3);
 			}
-
-			workingIndex^=1;
-			ready[workingIndex] = false; 
-			buffer = buffer_base[workingIndex] + lastLSN % 512;
-			assert(AIOworking == false);
-
-			// init a new request
-
-			log_manager[logger]->get_next_log_chunk(buffer, buffer_base[workingIndex^1], file_size, lastTime, cb, AIOworking, ready[workingIndex^1], lastChunkNum, lastLSN);
-
-			//assert(AIOworking == true);
-			offset = 0;
+			else
+			{
+				if(eof && poolStart == poolEnd)
+					break; // finished
+				else
+				{
+					PAUSE
+					lz4 = get_sys_clock();
+					INC_INT_STATS(time_recover4, lz4 - lz2);
+				}
+			}
 		}
-		tt = get_sys_clock();
-
-		// fill in the pool
-		while (offset < file_size && poolEnd - poolStart < g_poolsize_wait) {
-			uint32_t checksum;
-			uint32_t size; 
-			uint64_t start = offset;
-			UNPACK(buffer, checksum, offset);
-			assert(checksum == 0xbeef);
-			UNPACK(buffer, size, offset);
-			assert(size < g_max_log_entry_size);
-			// add this txn into the pool
-			LoggingThread::poolItem * it = pool + poolEnd % g_poolsize_wait;
-			it->size = size;
-			char * ptdentry = buffer + start;
-#if UPDATE_SIMD && MAX_LOGGER_NUM_SIMD==16
-			// read meta_info
-			uint64_t *LV_start = (uint64_t *)(ptdentry + it->size - sizeof(uint64_t) * MAX_LOGGER_NUM_SIMD);
-			INC_INT_STATS_V0(int_aux_bytes, sizeof(uint64_t) * MAX_LOGGER_NUM_SIMD);
-#else
-			// read meta_info
-			uint64_t *LV_start = (uint64_t *)(ptdentry + it->size - sizeof(uint64_t) * g_num_logger);
-			INC_INT_STATS_V0(int_aux_bytes, sizeof(uint64_t) * g_num_logger);
-#endif
-#if TAURUS_CHUNK_MEMCPY
-			memcpy(it->txnData, ptdentry, size);
-			memcpy(it->txnLV, LV_start, sizeof(uint64_t) * g_num_logger);
-#else
-			it->txnLV = LV_start;
-			it->txnData = ptdentry;
-#endif
-			assert(*(uint32_t*)it->txnData == 0xbeef);
-			it->recovered = 0;
-			it->LSN[0] = base_lsn + start + 1;
-			latestLSN = base_lsn + start + 1;
-			//
-			uint32_t size_aligned = size % 64 == 0 ? size: size + 64 - size % 64;
-			INC_INT_STATS(int_debug5, size_aligned);
-			offset = start + size_aligned;
-			*log_manager->maxLVSPSC[loggerId][workerId] = base_lsn + start + 1;
-			++poolEnd;
-		}
-
-		// try to recover txn from the pool
+		// scan the pool to see if we can recover any
 		uint64_t poolIndex = poolStart;
 		bool found = false;
 		bool checkSuccessive = true; // do not optimize this!
-		uint64_t lz4 = get_sys_clock();
 
-		for(;poolIndex < poolStart + g_scan_window && 
-			poolIndex < poolEnd; poolIndex ++)
+		for(;poolIndex < poolEnd; poolIndex ++)
 		{
 #if RECOVERY_FULL_THR	
 				if(glob_manager->_workload->sim_done>0)
 					break; // someone has finished.
 #endif
-				it = pool + poolIndex % g_poolsize_wait;
+				it = pool[poolIndex % g_poolsize_wait];
 				if(it->recovered)
 					continue;
 				if(checkSuccessive)
@@ -1276,30 +1351,24 @@ void txn_man::taurus_recover() {
 				//int unroll = (g_num_logger/4) * 4;
 				for(; i<g_num_logger; i++)
 				{
-					if(it->txnLV[i] <= rlv_cache[i]) continue;
-					rlv_cache[i] = *log_manager->recoverLVSPSC_min[i];
 					//uint64_t txnLVi_cache = it->txnLV[i];
-					if(it->txnLV[i] <= rlv_cache[i])
+					if(it->txnLV[i] <= *log_manager->recoverLVSPSC_min[i])
 						continue;
-					if(it->txnLV[i] - rlv_cache[i] > g_rlv_delta)
-						break; // do not re-compute
 						// must be good even if it is stale
-					uint64_t recoverLV_i_min = UINT64_MAX, maxLV_min = UINT64_MAX; // *log_manager->maxLVSPSC[i][0];
-					// just in case every pool is empty.
+					uint64_t recoverLV_i_min = UINT64_MAX;
 					for(j=0; j<num_worker; j++)
 					// unnecessary to be atomic.
 					// It is good to have recoverLVSPSC in a same cacheline!
 					{
 						uint64_t recoverlvspscIJ = *log_manager->recoverLVSPSC[i][j];
-						uint64_t maxlvspscIJ = *log_manager->maxLVSPSC[i][j];
-						if(maxlvspscIJ > recoverlvspscIJ && recoverLV_i_min > recoverlvspscIJ)
-							recoverLV_i_min = recoverlvspscIJ;
-						if(maxLV_min > maxlvspscIJ)
-							maxLV_min = maxlvspscIJ;
+					uint64_t maxlvspscIJ = *log_manager->maxLVSPSC[i][j];
+					if(maxlvspscIJ > recoverlvspscIJ && recoverLV_i_min > recoverlvspscIJ)
+						recoverLV_i_min = recoverlvspscIJ;
+					if(recoverLV_i_min > maxlvspscIJ)
+						recoverLV_i_min = maxlvspscIJ;
 							//break;
 					}
-					if(recoverLV_i_min == UINT64_MAX)
-						recoverLV_i_min = maxLV_min;
+					//INC_INT_STATS(int_debug10, 1);
 					// unnecessary to atomically update
 					*log_manager->recoverLVSPSC_min[i] = recoverLV_i_min;
 					//if(j<num_worker)
@@ -1309,7 +1378,6 @@ void txn_man::taurus_recover() {
 				if(i<g_num_logger)
 				{
 					//it->latch = 0; // release back
-					INC_INT_STATS(int_debug10, 1); // could not recover for noe
 					continue;
 				}
 				found = true;
@@ -1324,10 +1392,9 @@ void txn_man::taurus_recover() {
 		}
 		if(found)
 		{
-			assert(*(uint32_t*)it->txnData == 0xbeef);
 			recover_txn(it->txnData + sizeof(uint32_t) * 2);
 			
-			INC_INT_STATS_V0(num_commits, 1);
+			INC_INT_STATS(num_commits, 1);
 
 			//uint32_t size_aligned = it->size % 64 == 0 ? it->size : it->size + 64 - it->size % 64;
 			//INC_INT_STATS(int_debug5, size_aligned);
@@ -1339,195 +1406,16 @@ void txn_man::taurus_recover() {
 	if(glob_manager->_workload->sim_done>0)
 		break; // someone has finished.
 #endif
-
 	}
-
-#else // if not ASYNC_IO
-
-	LoggingThread::poolItem *it;
-	assert(g_thread_cnt % g_num_logger == 0);
-	uint64_t poolStart = 0, poolEnd = 0;
-	LogManager * logger = log_manager->_logger[loggerId];
-	uint64_t file_size = 0;
-	uint64_t offset = 0;
-	char * buffer_base = (char*) MALLOC(logger->_chunk_size + 512, GET_THD_ID);
-	uint64_t tt;
-	uint64_t * rlv_cache = (uint64_t*) MALLOC(sizeof(uint64_t) * g_num_logger, GET_THD_ID);
-	memset(rlv_cache, 0, sizeof(uint64_t) * g_num_logger);
-	LoggingThread *lt = logging_thds[loggerId];
-	uint32_t chunk_num=0;
-	char * buffer = NULL;
-	uint64_t base_lsn=0;
-	while (true)
-	{
-#if TAURUS_CHUNK_MEMCPY
-		if (offset >= file_size) // memcpy is turned on
-#else
-		// acquire a new chunk when empty
-		if (offset >= file_size && poolStart == poolEnd)
-#endif
-		{
-			// we need a new chunk
-			base_lsn = 0;
-			tt = get_sys_clock();
-			
-			buffer = buffer_base;
-			chunk_num = logger->get_next_log_chunk(buffer, file_size, base_lsn);
-			INC_INT_STATS_V0(time_io, get_sys_clock() - tt);
-			INC_FLOAT_STATS_V0(log_bytes, file_size);
-			if (chunk_num == (uint32_t)-1) 
-			{
-				if(poolStart == poolEnd)
-					break;
-				file_size = 0;
-			}
-			assert(buffer);
-			offset = 0;
-		}
-		tt = get_sys_clock();
-
-		// fill in the pool
-		while (offset < file_size && poolEnd - poolStart < g_poolsize_wait) {
-			uint32_t checksum;
-			uint32_t size; 
-			uint64_t start = offset;
-			UNPACK(buffer, checksum, offset);
-			assert(checksum == 0xbeef);
-			UNPACK(buffer, size, offset);
-			assert(size < g_max_log_entry_size);
-			// add this txn into the pool
-			LoggingThread::poolItem * it = pool + poolEnd % g_poolsize_wait;
-			it->size = size;
-			char * ptdentry = buffer + start;
-#if UPDATE_SIMD && MAX_LOGGER_NUM_SIMD==16
-			// read meta_info
-			uint64_t *LV_start = (uint64_t *)(ptdentry + it->size - sizeof(uint64_t) * MAX_LOGGER_NUM_SIMD);
-			INC_INT_STATS_V0(int_aux_bytes, sizeof(uint64_t) * MAX_LOGGER_NUM_SIMD);
-#else
-			// read meta_info
-			uint64_t *LV_start = (uint64_t *)(ptdentry + it->size - sizeof(uint64_t) * g_num_logger);
-			INC_INT_STATS_V0(int_aux_bytes, sizeof(uint64_t) * g_num_logger);
-#endif
-#if TAURUS_CHUNK_MEMCPY
-			memcpy(it->txnData, ptdentry, size);
-			memcpy(it->txnLV, LV_start, sizeof(uint64_t) * g_num_logger);
-#else
-			it->txnLV = LV_start;
-			it->txnData = ptdentry;
-#endif
-			assert(*(uint32_t*)it->txnData == 0xbeef);
-			it->recovered = 0;
-			it->LSN[0] = base_lsn + start + 1;
-			latestLSN = base_lsn + start + 1;
-			//
-			uint32_t size_aligned = size % 64 == 0 ? size: size + 64 - size % 64;
-			INC_INT_STATS(int_debug5, size_aligned);
-			offset = start + size_aligned;
-			*log_manager->maxLVSPSC[loggerId][workerId] = base_lsn + start + 1;
-			++poolEnd;
-		}
-
-		// try to recover txn from the pool
-		uint64_t poolIndex = poolStart;
-		bool found = false;
-		bool checkSuccessive = true; // do not optimize this!
-		uint64_t lz4 = get_sys_clock();
-
-		for(;poolIndex < poolStart + g_scan_window && 
-			poolIndex < poolEnd; poolIndex ++)
-		{
-#if RECOVERY_FULL_THR	
-				if(glob_manager->_workload->sim_done>0)
-					break; // someone has finished.
-#endif
-				it = pool + poolIndex % g_poolsize_wait;
-				if(it->recovered)
-					continue;
-				if(checkSuccessive)
-				{
-					*log_manager->recoverLVSPSC[loggerId][workerId] = it->LSN[0] - 1;
-					poolStart = poolIndex;
-					checkSuccessive = false;
-				}
-				uint i=0, j=0;
-				// use SIMD and manual unroll
-				//int unroll = (g_num_logger/4) * 4;
-				for(; i<g_num_logger; i++)
-				{
-					if(it->txnLV[i] <= rlv_cache[i]) continue;
-					rlv_cache[i] = *log_manager->recoverLVSPSC_min[i];
-					//uint64_t txnLVi_cache = it->txnLV[i];
-					if(it->txnLV[i] <= rlv_cache[i])
-						continue;
-					if(it->txnLV[i] - rlv_cache[i] > g_rlv_delta)
-						break; // do not re-compute
-						// must be good even if it is stale
-					uint64_t recoverLV_i_min = UINT64_MAX, maxLV_min = UINT64_MAX; // *log_manager->maxLVSPSC[i][0];
-					// just in case every pool is empty.
-					for(j=0; j<num_worker; j++)
-					// unnecessary to be atomic.
-					// It is good to have recoverLVSPSC in a same cacheline!
-					{
-						uint64_t recoverlvspscIJ = *log_manager->recoverLVSPSC[i][j];
-						uint64_t maxlvspscIJ = *log_manager->maxLVSPSC[i][j];
-						if(maxlvspscIJ > recoverlvspscIJ && recoverLV_i_min > recoverlvspscIJ)
-							recoverLV_i_min = recoverlvspscIJ;
-						if(maxLV_min > maxlvspscIJ)
-							maxLV_min = maxlvspscIJ;
-							//break;
-					}
-					if(recoverLV_i_min == UINT64_MAX)
-						recoverLV_i_min = maxLV_min;
-					// unnecessary to atomically update
-					*log_manager->recoverLVSPSC_min[i] = recoverLV_i_min;
-					//if(j<num_worker)
-					if(it->txnLV[i] > recoverLV_i_min)
-						break;
-				}
-				if(i<g_num_logger)
-				{
-					//it->latch = 0; // release back
-					INC_INT_STATS(int_debug10, 1); // could not recover for noe
-					continue;
-				}
-				found = true;
-				break;
-		}
-		uint64_t lz5 = get_sys_clock();
-		INC_INT_STATS(time_recover6, lz5 - lz4);
-		if(checkSuccessive) // && poolEnd > poolStart)// means the pool is full of recovered txns
-		{
-			poolStart = poolIndex; // here poolIndex is the (maybe stale) poolEnd.
-			*log_manager->recoverLVSPSC[loggerId][workerId] = latestLSN; //lt->maxLSN[0];
-		}
-		if(found)
-		{
-			assert(*(uint32_t*)it->txnData == 0xbeef);
-			recover_txn(it->txnData + sizeof(uint32_t) * 2);
-			
-			INC_INT_STATS_V0(num_commits, 1);
-
-			//uint32_t size_aligned = it->size % 64 == 0 ? it->size : it->size + 64 - it->size % 64;
-			//INC_INT_STATS(int_debug5, size_aligned);
-			it->recovered = 1; // so logging thread can recycle.
-		}
-		uint64_t lz6 = get_sys_clock();
-		INC_INT_STATS(time_recover7, lz6 - lz5);
-#if RECOVERY_FULL_THR	
-	if(glob_manager->_workload->sim_done>0)
-		break; // someone has finished.
-#endif
-
-	}
-#endif // end if async_io
+	_mm_free(default_entry);
 #if RECOVERY_FULL_THR	
 	glob_manager->_workload->sim_done = 1;
 #endif
 	INC_INT_STATS(time_recover_full, get_sys_clock() - recover_full_start);
-	ATOM_ADD(lt->workerDone[0], 1);  // notify the logger.
+	//ATOM_ADD(lt->workerDone[0], 1);  // notify the logger.
 	
 	sstream << "Recover finished for worker " << GET_THD_ID << " of logger " << loggerId << endl;
-	std::cout << sstream.str(); // atomic output.
+	cout << sstream.str(); // atomic output.
 	return;
 #else
 #if RECOVER_TAURUS_LOCKFREE
@@ -1576,7 +1464,6 @@ void txn_man::taurus_recover() {
 				continue;
 			}
 			found = true;
-			
 			break;
 		}
 		//*(lt->mutex) = 0;
@@ -1586,7 +1473,7 @@ void txn_man::taurus_recover() {
 		{
 			recover_txn(it->txnData + sizeof(uint32_t) * 2);
 			
-			INC_INT_STATS_V0(num_commits, 1);
+			INC_INT_STATS(num_commits, 1);
 			uint64_t tt4 = get_sys_clock();
 			INC_INT_STATS(time_recover3, tt4 - tt3); // re-execute the transaction
 			
@@ -1613,7 +1500,7 @@ void txn_man::taurus_recover() {
 	uint32_t workerId = GET_THD_ID / g_num_logger;
 	
 	#if COMPRESS_LSN_LOG
-			uint64_t * LVFence = (uint64_t*) MALLOC(sizeof(uint64_t) * g_num_logger, GET_THD_ID);
+			uint64_t * LVFence = (uint64_t*) _mm_malloc(sizeof(uint64_t) * g_num_logger, ALIGN_SIZE);
 			memset(LVFence, 0, sizeof(uint64_t) * g_num_logger);
 	#endif
 	//cout << workerId << " " << logger << endl;
@@ -1632,8 +1519,6 @@ void txn_man::taurus_recover() {
 	//uint64_t poolStep = PRIMES[GET_THD_ID/g_num_logger];
 	//while(!(lt->poolDone && poolEnd<=poolStart))
 	// TODO: lt->pool->empty() might cause data racing.
-	uint64_t * rlv_cache = (uint64_t*) MALLOC(sizeof(uint64_t) * g_num_logger, GET_THD_ID);
-	memset(rlv_cache, 0, sizeof(uint64_t) * g_num_logger);
 	for(;;)
 	{
 		INC_INT_STATS(int_debug8, 1);
@@ -1656,6 +1541,8 @@ void txn_man::taurus_recover() {
 		poolIndex < *poolStart + g_scan_window && 
 			poolIndex < *poolEnd; poolIndex ++)
 		{
+			//uint64_t loopstart = get_sys_clock();
+			//uint64_t tt = get_sys_clock();
 			// it's ok if poolIndex here is actually behind the poolStart
 			// and read some newly pushed item
 			it = pool[poolIndex % g_poolsize_wait];
@@ -1678,7 +1565,7 @@ void txn_man::taurus_recover() {
 									memcpy(LVFence, ptdentry + sizeof(uint32_t) * 2, sizeof(uint64_t) * g_num_logger);
 									it->recovered = 1;// No recover for PSN
 									it->rasterized = 1;
-									INC_INT_STATS_V0(int_aux_bytes, sizeof(uint64_t) * g_num_logger + sizeof(uint32_t) * 2);
+									INC_INT_STATS(int_aux_bytes, sizeof(uint64_t) * g_num_logger + sizeof(uint32_t) * 2);
 									continue;
 								}
 								else
@@ -1694,8 +1581,8 @@ void txn_man::taurus_recover() {
 											uint64_t psnToWrite = *(uint64_t*)(ptdentry + it->size - 1 - sizeof(uint64_t) * i);
 											it->txnLV[psnToWrite&((1<<5)-1)] = psnToWrite >> 5;
 										}
-										//INC_INT_STATS_V0(int_aux_bytes, (psnCounter + 1) * sizeof(uint64_t));
-										INC_INT_STATS_V0(int_aux_bytes, psnCounter * sizeof(uint64_t) + 1);
+										//INC_INT_STATS(int_aux_bytes, (psnCounter + 1) * sizeof(uint64_t));
+										INC_INT_STATS(int_aux_bytes, psnCounter * sizeof(uint64_t) + 1);
 								}
 #else
 								// read meta_info
@@ -1704,9 +1591,9 @@ void txn_man::taurus_recover() {
 								{
 									it->txnLV[i] = LV_start[i];
 								}
-								INC_INT_STATS_V0(int_aux_bytes, sizeof(uint64_t) * g_num_logger);
+								INC_INT_STATS(int_aux_bytes, sizeof(uint64_t) * g_num_logger);
 #endif
-				INC_INT_STATS_V0(num_log_entries, 1);
+				INC_INT_STATS(num_log_entries, 1);
 				
 				it->rasterized = 1;
 			}
@@ -1720,25 +1607,33 @@ void txn_man::taurus_recover() {
 
 			for(; i<g_num_logger; i++)
 			{
+				
+				//uint64_t txnLVi_cache = it->txnLV[i];
 
 #if RECOVER_SINGLE_RECOVERLV
 				if(it->txnLV[i] > *log_manager->recoverLVSPSC[i][0])
 					break;
 				continue;
 #endif
-				if(it->txnLV[i] <= rlv_cache[i]) continue;
-				rlv_cache[i] =  *log_manager->recoverLVSPSC_min[i];
+				if(it->txnLV[i] == 0) continue;
+				uint64_t rlvi =  *log_manager->recoverLVSPSC_min[i];
 
                 //continue; // bypass the rlv check
                 
-				if(it->txnLV[i] <= rlv_cache[i]){
+				if(it->txnLV[i] <= rlvi){
 					//printf("i=%d, txnLV[i] = %lu, recoverLVSPSC = %lu \n", i, it->txnLV[i], *log_manager->recoverLVSPSC_min[i]);
 					continue;
 				}
 
-				if(it->txnLV[i] - rlv_cache[i] > g_rlv_delta)
+				//break; // suppose RLV_DELTA = 0
+				if(it->txnLV[i] - rlvi > g_rlv_delta)
 					break; // do not re-compute
 
+				
+				
+				//continue;
+				//printf("%lu: i=%d, txnLV[i] = %lu, recoverLVSPSC_min = %lu \n", GET_THD_ID, i, it->txnLV[i], *log_manager->recoverLVSPSC_min[i]);
+					// must be good even if it is stale
 				uint64_t recoverLV_i_min = UINT64_MAX, maxLV_min = UINT64_MAX; // *log_manager->maxLVSPSC[i][0];
 				// just in case every pool is empty.
 				for(j=0; j<num_worker; j++)
@@ -1767,7 +1662,7 @@ void txn_man::taurus_recover() {
 			if(i<g_num_logger)
 			{
 				//it->latch = 0; // release back
-				INC_INT_STATS(int_debug10, 1); // could not recover for noe
+				INC_INT_STATS(int_debug10, 1);
 				continue;
 			}
 #endif
@@ -1789,7 +1684,7 @@ void txn_man::taurus_recover() {
 			//cout << get_sys_clock() - it->starttime << endl;
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
-			INC_FLOAT_STATS_V0(latency, get_sys_clock() - it->starttime);
+			INC_FLOAT_STATS(latency, get_sys_clock() - it->starttime);
 #pragma GCC diagnostic pop
 			
 			//uint64_t tt4 = get_sys_clock();
@@ -1797,6 +1692,7 @@ void txn_man::taurus_recover() {
 			it->recovered = 1; // so logging thread can recycle.
 			if(poolIndex == *poolStart)
 			{
+
 				poolIndex += 1;
 				*poolStart = poolIndex;
 			}
@@ -1815,9 +1711,9 @@ void txn_man::taurus_recover() {
 #if LOG_TYPE == LOG_DATA && WORKLOAD == TPCC
 			UPDATE_RECOVER_LSN
 #endif			
-            
+
 			INC_INT_STATS(int_debug5, size_aligned);
-			INC_INT_STATS_V0(num_commits, 1);
+			INC_INT_STATS(num_commits, 1);
 			INC_INT_STATS(time_debug4, get_sys_clock() - tt3); // re-execute the transaction
 		}
 		else
@@ -1852,53 +1748,6 @@ void txn_man::taurus_recover() {
 #endif
 }
 
-#elif LOG_ALGORITHM == LOG_PLOVER
-
-void 
-txn_man::plover_recover() {
-	char default_entry[g_max_log_entry_size];
-	// right now, only a single thread does the recovery job.
-	uint32_t log_id = GET_THD_ID % g_num_logger;
-	uint32_t count = 0;
-	uint32_t callback_size;
-	while (true) {
-		char * entry = default_entry;
-		uint64_t tt = get_sys_clock();
-		uint64_t lsn = log_manager->_logger[log_id]->get_next_log_entry(entry, callback_size);
-		if (entry == NULL) {
-			if (log_manager->_logger[log_id]->iseof()) {
-				lsn = log_manager->_logger[log_id]->get_next_log_entry(entry, callback_size);
-				if (entry == NULL)
-					break;
-			}
-			else { 
-				PAUSE //usleep(50);
-				INC_INT_STATS(time_wait_io, get_sys_clock() - tt);
-				continue;
-			}
-		}
-		uint64_t tt2 = get_sys_clock();
-		INC_INT_STATS(time_wait_io, tt2 - tt);
-		// Format for serial logging
-		// | checksum | size | ... |
-		assert(*(uint32_t*)entry == 0xbeef || entry[0] == 0x7f);
-		
-    	recover_txn(entry + sizeof(uint32_t) * 2);
-		
-		uint64_t gsn;
-		gsn = *(uint64_t*)(entry + callback_size - sizeof(uint64_t)); // the last uint64_t
-
-		//printf("size=%d lsn=%ld\n", *(uint32_t*)(entry+4), lsn);
-		COMPILER_BARRIER
-		//INC_INT_STATS(time_recover_txn, get_sys_clock() - tt2);
-		log_manager->_logger[log_id]->set_gc_lsn(lsn);
-		if(gsn & LOCK_BIT) // we only count once
-			INC_INT_STATS_V0(num_commits, 1);
-		INC_INT_STATS(num_log_records, 1);
-		count ++;
-	}
-}
-
 #elif LOG_ALGORITHM == LOG_SERIAL 
 
 void 
@@ -1920,12 +1769,12 @@ txn_man::serial_recover() {
 			}
 			else { 
 				PAUSE //usleep(50);
-				INC_INT_STATS(time_wait_io, get_sys_clock() - tt);
+				INC_INT_STATS(time_io, get_sys_clock() - tt);
 				continue;
 			}
 		}
 		uint64_t tt2 = get_sys_clock();
-		INC_INT_STATS(time_wait_io, tt2 - tt);
+		INC_INT_STATS(time_io, tt2 - tt);
 		// Format for serial logging
 		// | checksum | size | ... |
 		assert(*(uint32_t*)entry == 0xbeef || entry[0] == 0x7f);
@@ -1938,7 +1787,7 @@ txn_man::serial_recover() {
 		COMPILER_BARRIER
 		//INC_INT_STATS(time_recover_txn, get_sys_clock() - tt2);
 		log_manager->_logger[0]->set_gc_lsn(lsn);
-		INC_INT_STATS_V0(num_commits, 1);
+		INC_INT_STATS(num_commits, 1);
 		count ++;
 	}
 }
@@ -1961,8 +1810,8 @@ txn_man::parallel_recover() {
 		uint64_t base_lsn = 0;
 		uint64_t tt = get_sys_clock();
 		uint32_t chunk_num = log_manager[logger]->get_next_log_chunk(buffer, file_size, base_lsn);
-		INC_INT_STATS_V0(time_io, get_sys_clock() - tt);
-		INC_FLOAT_STATS_V0(log_bytes, file_size);
+		INC_INT_STATS(time_io, get_sys_clock() - tt);
+		INC_FLOAT_STATS(log_bytes, file_size);
 		if (chunk_num == (uint32_t)-1) 
 			break;
 	
@@ -2044,7 +1893,7 @@ txn_man::parallel_recover() {
 				log_entry = NULL;
 				log_recover_table->remove_txn(node, log_entry, next);
 				node = next;
-				INC_INT_STATS_V0(num_commits, 1);
+				INC_INT_STATS(num_commits, 1);
 			} while (log_entry);
 		} else { //if (log_recover_table->is_recover_done()) {
 			if (last_idle_time == 0)
@@ -2064,109 +1913,10 @@ txn_man::parallel_recover() {
 	INC_INT_STATS(time_phase3, get_sys_clock() - tt);
 }
 #elif LOG_ALGORITHM == LOG_BATCH
-#if ASYNC_IO && !WORK_IN_PROGRESS
-void txn_man::batch_recover()
-{
-	assert(glob_manager->_workload->sim_done==0);
-	pthread_barrier_wait(&worker_bar);
-	
-	uint64_t starttime = get_sys_clock();
-	uint32_t logger = GET_THD_ID % g_num_logger;
-	uint64_t file_size;
-	uint32_t offset = 0;
-	char * buffer_base[2];
-	buffer_base[0] = (char*) MALLOC(log_manager[logger]->_chunk_size + 512, GET_THD_ID);
-	buffer_base[1] = (char*) MALLOC(log_manager[logger]->_chunk_size + 512, GET_THD_ID);
-	uint64_t workingIndex=0;
-	aiocb64 cb;
-	memset(&cb, 0, sizeof(aiocb64));
-	
-	uint32_t lastChunkNum = 0;
-	uint64_t lastLSN = 0;
-	uint64_t lastSize = 0;
-	uint64_t lastTime = 0;
-	bool AIOworking = false;
-	bool ready[2];
-	ready[0] = ready[1] = false;
-	while (true) {
-		file_size = 0;
-		buffer = buffer_base[workingIndex];
-		uint64_t base_lsn = 0;
-		uint64_t tt = get_sys_clock();
-		log_manager[logger]->get_next_log_chunk(buffer, buffer_base[workingIndex^1], file_size, lastTime, cb, AIOworking, ready[workingIndex^1], lastChunkNum, lastLSN);
-		
-		if(!ready[workingIndex^1])
-		{
-			PAUSE
-			continue;
-		}
-
-		workingIndex^=1;
-		offset =0;
-		ready[workingIndex] = false; 
-		buffer = buffer_base[workingIndex] + lastLSN % 512;
-		assert(AIOworking == false);
-		
-		// initiate a new request
-		
-		log_manager[logger]->get_next_log_chunk(buffer, buffer_base[workingIndex^1], file_size, lastTime, cb, AIOworking, ready[workingIndex^1], lastChunkNum, lastLSN);
-
-		//assert(AIOworking == true);
-
-		// Format of log record 
-		// | checksum | size | ... 
-		tt = get_sys_clock();
-		while (offset < file_size) {
-			// read entries from buffer
-			uint32_t checksum;
-			uint32_t size; 
-			uint64_t tid;
-			uint32_t start = offset;
-			UNPACK(buffer, checksum, offset);
-			UNPACK(buffer, size, offset);
-			assert(size < g_max_log_entry_size);
-			UNPACK(buffer, tid, offset);
-			if (checksum != 0xbeef) {
-				printf("checksum=%x, offset=%d, fsize=%lu\n", checksum, offset, file_size);
-				break;
-			}
-			recover_txn(buffer + offset);
-			INC_INT_STATS_V0(num_commits, 1);
-			uint32_t size_aligned = size % 64 == 0 ? size: size + 64 - size % 64;
-			INC_INT_STATS(int_debug5, size_aligned);
-			offset = start + size_aligned;
-#if RECOVERY_FULL_THR
-			if (glob_manager->_workload->sim_done > 0)
-				break;
-#endif				
-		}
-		INC_INT_STATS(time_debug2, get_sys_clock() - tt);
-
-		// if there is no next chunk
-		if (lastChunkNum >= log_manager[logger]->_num_chunks - 1) 
-			break;
-
-		//log_manager[logger]->return_log_chunk(buffer, chunk_num);
-#if RECOVERY_FULL_THR				
-		if (glob_manager->_workload->sim_done > 0)
-				break;
-#endif
-		INC_INT_STATS(time_debug3, get_sys_clock() - tt);
-	}
-#if RECOVERY_FULL_THR
-  //cout <<	GET_THD_ID << " set " << offset << " " << file_size << " " <<  stats->_stats[GET_THD_ID]->_int_stats[STAT_num_commits] << endl;
-	glob_manager->_workload->sim_done = 1;
-#endif
-	INC_INT_STATS(time_phase1_1_raw, get_sys_clock() - starttime);
-}
-#else
 void
 txn_man::batch_recover()
 {
-//	if (GET_THD_ID == 0) {
-//		_log_lock = new pthread_mutex_t;
-//		pthread_mutex_init(_log_lock, NULL);
-//	}
+
 	assert(glob_manager->_workload->sim_done==0);
 	pthread_barrier_wait(&worker_bar);
 	
@@ -2174,17 +1924,16 @@ txn_man::batch_recover()
 	uint32_t logger = GET_THD_ID % g_num_logger;
 	uint64_t file_size;
 	uint32_t offset;
-	char * buffer_base = (char*) MALLOC(log_manager[logger]->_chunk_size, GET_THD_ID);
 	while (true) {
-		char * buffer = buffer_base;
+		char * buffer = NULL;
 		file_size = 0;
 		uint64_t base_lsn = 0;
 		uint64_t tt = get_sys_clock();
 		uint32_t chunk_num = log_manager[logger]->get_next_log_chunk(buffer, file_size, base_lsn);
 		//cout <<	GET_THD_ID << " " << chunk_num << endl;
-		INC_INT_STATS_V0(time_io, get_sys_clock() - tt);
+		INC_INT_STATS(time_io, get_sys_clock() - tt);
 		//INC_INT_STATS(time_debug1, get_sys_clock() - tt);
-		INC_FLOAT_STATS_V0(log_bytes, file_size);
+		INC_FLOAT_STATS(log_bytes, file_size);
 		if (chunk_num == (uint32_t)-1) 
 			break;
 		assert(buffer);
@@ -2208,7 +1957,7 @@ txn_man::batch_recover()
 			}
 			
 			recover_txn(buffer + offset);
-			INC_INT_STATS_V0(num_commits, 1);
+			INC_INT_STATS(num_commits, 1);
 			uint32_t size_aligned = size % 64 == 0 ? size: size + 64 - size % 64;
 			INC_INT_STATS(int_debug5, size_aligned);
 			offset = start + size_aligned;
@@ -2223,7 +1972,6 @@ txn_man::batch_recover()
 		if (glob_manager->_workload->sim_done > 0)
 				break;
 #endif
-		INC_INT_STATS(time_debug3, get_sys_clock() - tt);
 	}
 #if RECOVERY_FULL_THR
   //cout <<	GET_THD_ID << " set " << offset << " " << file_size << " " <<  stats->_stats[GET_THD_ID]->_int_stats[STAT_num_commits] << endl;
@@ -2235,19 +1983,18 @@ txn_man::batch_recover()
 
 }
 #endif
-#endif
 
 uint32_t
 txn_man::get_log_entry_size()
 {
 	assert(false);
 	return 0;
+
 }
 
 uint32_t 
 txn_man::get_log_entry_length()  ////////////////////// TODOTODO
 {
-#if CC_ALG == SILO
 	// TODO. in order to have a fair comparison with SiloR, Taurus only supports Silo at the moment 
 	//assert(CC_ALG == SILO);
 	//uint32_t ret = 0;
@@ -2355,97 +2102,15 @@ txn_man::get_log_entry_length()  ////////////////////// TODOTODO
 #endif
 	assert(false);
 	return 0;
-#else
-	assert(false);
-	return 0;
-#endif
 }
 
 void 
 txn_man::create_log_entry()  ////////////////////// TODOTODO
 {
-
+	//printf("insert cnt %lu\n", insert_cnt);
 	// TODO. in order to have a fair comparison with SiloR, Taurus only supports Silo at the moment 
 	//assert(CC_ALG == SILO);
 #if LOG_ALGORITHM != LOG_NO
-#if LOG_ALGORITHM == LOG_PLOVER
-#if LOG_TYPE == LOG_DATA
-	memset(_targets, 0, sizeof(uint64_t) * g_num_logger);
-	uint32_t offsets[g_num_logger];
-	memset(offsets, 0, sizeof(uint32_t) * g_num_logger);
-	uint32_t checksum = 0xbeef;
-	for (uint32_t rid=0; rid < wr_cnt; rid++)
-	{
-		uint64_t partition = logPartition((uint64_t)accesses[write_set[rid]]->orig_row);
-		_targets[partition] ++;
-	}
-	for(uint32_t lid=0; lid<g_num_logger; lid++)
-		if(_targets[lid])
-		{
-			//printf("[%lu] _targets[%d] = %lu\n", GET_THD_ID, lid, _targets[lid]);
-			PACK(_log_entries[lid], checksum, offsets[lid]);
-			offsets[lid] += sizeof(uint32_t); // make space for size;
-			uint32_t wr_cnt_lid = _targets[lid];
-			PACK(_log_entries[lid], wr_cnt_lid, offsets[lid]);
-		}
-	
-	
-	for (uint32_t i = 0; i < wr_cnt; i ++) {
-	
-		row_t * orig_row = accesses[write_set[i]]->orig_row; 
-		uint64_t lid = logPartition((uint64_t)accesses[write_set[i]]->orig_row);
-		uint32_t table_id = orig_row->get_table()->get_table_id();
-		uint64_t key = orig_row->get_primary_key();
-		uint32_t tuple_size = orig_row->get_tuple_size();
-		char * tuple_data = accesses[write_set[i]]->data;
-		//assert(tuple_size!=0);
-
-		PACK(_log_entries[lid], table_id, offsets[lid]);
-		PACK(_log_entries[lid], key, offsets[lid]);
-		PACK(_log_entries[lid], tuple_size, offsets[lid]);
-		assert(offsets[lid] + tuple_size <= g_max_log_entry_size);
-		PACK_SIZE(_log_entries[lid], tuple_data, tuple_size, offsets[lid]);
-	}
-	// #endif
-	// TODO checksum is ignored. 
-	for(uint32_t lid=0; lid<g_num_logger; lid++)
-		if(_targets[lid])
-		{
-			_log_entry_sizes[lid] = offsets[lid];
-			assert(_log_entry_sizes[lid] < g_max_log_entry_size);
-			// update size. 
-			memcpy(_log_entries[lid] + sizeof(uint32_t), &_log_entry_sizes[lid], sizeof(uint32_t));
-			//cout << _log_entry_size << endl;
-			INC_FLOAT_STATS(log_total_size, _log_entry_sizes[lid]);
-			INC_INT_STATS_V0(num_log_entries, 1);
-		}
-#else
-	// Format for serial logging
-	// 	| checksum | size | benchmark_specific_command | 
-	// Format for parallel logging
-	// 	| checksum | size | predecessor_info | benchmark_specific_command | 
-	for(uint32_t lid=0; lid<g_num_logger; lid++)
-		if(_targets[lid])
-		{
-			uint32_t offset = 0;
-			uint32_t checksum = 0xbeef;
-			uint32_t size = 0;
-			PACK(_log_entries[lid], checksum, offsets[lid]);
-			PACK(_log_entries[lid], size, offsets[lid]);
-
-			_log_entry_sizes[lid] = offsets[lid];
-			// internally, the following function will update _log_entry_size and _log_entry
-			get_cmd_log_entry(_log_entries[lid], _log_entry_sizes[lid]);
-			
-			assert(_log_entry_sizes[lid] < g_max_log_entry_size);
-			assert(_log_entry_sizes[lid] > sizeof(uint32_t) * 2);
-			memcpy(_log_entries[lid] + sizeof(uint32_t), &_log_entry_sizes[lid], sizeof(uint32_t));
-			INC_FLOAT_STATS(log_total_size, _log_entry_sizes[lid]);
-			INC_INT_STATS_V0(num_log_entries, 1);
-		}
-#endif
-#else
-// non-plover logging
 #if LOG_TYPE == LOG_DATA
 	// Format for serial logging
 	// | checksum:4 | size:4 | N:4 | (table_id:4 | primary_key:8 | data_length:4 | data:?) * N
@@ -2500,6 +2165,45 @@ txn_man::create_log_entry()  ////////////////////// TODOTODO
 	// no need to pack other stuff
   #endif
 
+#if TPCC_FULL
+// TODO: add insert/delete rows
+	#if TPCC_INSERT_ROWS
+	PACK(_log_entry, insert_cnt, offset);
+	//cout << "insertion not implemented. " << endl;
+	for (uint32_t i=0; i < insert_cnt; i++)
+	{
+		row_t * orig_row = insert_rows[i];
+		uint32_t table_id = orig_row->get_table()->get_table_id();
+		uint64_t key = orig_row->get_primary_key();
+		uint64_t part_id = orig_row->get_part_id();
+		//uint32_t tuple_size = orig_row->get_tuple_size();
+
+		//printf("[%lu] log insert table %u, row_key %lu\n", get_thd_id(), table_id, key);
+		
+		char * tuple_data = orig_row->data;
+		PACK(_log_entry, table_id, offset);
+		PACK(_log_entry, key, offset);
+		PACK(_log_entry, part_id, offset);
+		//PACK(_log_entry, tuple_size, offset);
+		//PACK_SIZE(_log_entry, tuple_data, tuple_size, offset);
+	}
+	#endif
+	#if TPCC_INSERT_INDEX
+	PACK(_log_entry, insert_idx_cnt, offset);
+	for(uint32_t i=0; i< insert_idx_cnt; i++)
+	{
+		int idx_ind = insert_idx_id[i];
+		idx_key_t idx_key = insert_idx_key[i];
+		uint32_t idx_row_id = insert_idx_row_id[i];
+		int part_id = insert_idx_part_id[i];
+		PACK(_log_entry, idx_ind, offset);
+		PACK(_log_entry, idx_key, offset);
+		PACK(_log_entry, idx_row_id, offset);
+		PACK(_log_entry, part_id, offset);
+	}
+	#endif
+#endif
+
 	PACK(_log_entry, wr_cnt, offset);
 	
 	for (uint32_t i = 0; i < wr_cnt; i ++) {
@@ -2509,22 +2213,43 @@ txn_man::create_log_entry()  ////////////////////// TODOTODO
 		uint64_t key = orig_row->get_primary_key();
 		uint32_t tuple_size = orig_row->get_tuple_size();
 		char * tuple_data = accesses[write_set[i]]->data;
+		//printf("table id %u, tuple_size %u\n", table_id, tuple_size);
 		//assert(tuple_size!=0);
+
+		//printf("[%lu] log write table %u, row_key %lu\n", get_thd_id(), table_id, key);
 
 		PACK(_log_entry, table_id, offset);
 		PACK(_log_entry, key, offset);
 		PACK(_log_entry, tuple_size, offset);
 		PACK_SIZE(_log_entry, tuple_data, tuple_size, offset);
 	}
+
+#if TPCC_FULL
+	#if TPCC_DELETE_INDEX
+	PACK(_log_entry, remove_idx_cnt, offset);
+	for(uint32_t i=0; i < remove_idx_cnt; i++)
+	{
+		int idx_ind = remove_idx_id[i];
+		idx_key_t idx_key = remove_idx_key[i];
+		int part_id = remove_idx_part_id[i];
+		PACK(_log_entry, idx_ind, offset);
+		PACK(_log_entry, idx_key, offset);
+		PACK(_log_entry, part_id, offset);
+		
+	}
+	#endif
+#endif
+	
 	// #endif
 	// TODO checksum is ignored. 
 	_log_entry_size = offset;
-	assert(_log_entry_size < g_max_log_entry_size);
+	M_ASSERT(_log_entry_size < g_max_log_entry_size, "log entry size viloation: log_entry_size=%d, g_max_log_entry_size = %d\n", _log_entry_size, g_max_log_entry_size);
+	//assert(_log_entry_size < g_max_log_entry_size);
 	// update size. 
 	memcpy(_log_entry + sizeof(uint32_t), &_log_entry_size, sizeof(uint32_t));
 	//cout << _log_entry_size << endl;
 	INC_FLOAT_STATS(log_total_size, _log_entry_size);
-	INC_INT_STATS_V0(num_log_entries, 1);
+	INC_INT_STATS(num_log_entries, 1);
 
 #elif LOG_TYPE == LOG_COMMAND
 	// Format for serial logging
@@ -2561,10 +2286,181 @@ txn_man::create_log_entry()  ////////////////////// TODOTODO
 	assert(_log_entry_size > sizeof(uint32_t) * 2);
 	memcpy(_log_entry + sizeof(uint32_t), &_log_entry_size, sizeof(uint32_t));
 	INC_FLOAT_STATS(log_total_size, _log_entry_size);
-	INC_INT_STATS_V0(num_log_entries, 1);
+	INC_INT_STATS(num_log_entries, 1);
 #else
 	assert(false);
 #endif
 #endif
-#endif
 }
+
+
+// insert_row/remove_row
+bool txn_man::insert_row(table_t* tbl, row_t*& row, int part_id, uint64_t& out_row_id) {
+#if TPCC_PHANTOM_AVOIDANCE && TPCC_PHANTOM_AVOIDANCE_ALG == PHANTOM_LOCK
+	char *tmpdata;
+	RC rc = get_row(tbl->tablewise_lock, WR, tmpdata);
+	if(rc==RCOK)
+	{
+		tbl->ex_lock_owner = txn_id;
+	}
+	else
+	{
+		if(tbl->ex_lock_owner != txn_id)
+		{
+			return false; // someone else has the ex lock
+		}
+		// otherwise it's me the lock owner.
+	}
+#endif
+
+  if (tbl->get_new_row(row, part_id, out_row_id) != RCOK) return false;
+	
+	assert(insert_cnt < MAX_ROW_PER_TXN);
+	
+	if(!g_log_recover)
+	{
+		insert_rows[insert_cnt ++] = row;
+		char * data;
+		auto rc = get_row(row, IS, data);
+		if (rc==Abort) return false;
+		
+	}
+	
+  	return true;
+}
+
+bool txn_man::remove_row(row_t* row) {
+	if(!g_log_recover)
+	{
+
+		for(uint32_t i=0; i<remove_cnt; i++)
+		{
+			if(remove_rows[i] == row) return true;
+		}
+		remove_rows[remove_cnt++] = row;
+	}
+	else
+	{
+		// remove the rows right away
+		// row->free_row();
+		row->is_deleted = 1;
+	}
+	
+  return true;
+}
+
+// index_insert/index_remove
+
+template <>
+bool txn_man::insert_idx(ORDERED_INDEX* index, uint64_t key, row_t* row, int part_id, int index_id) {
+
+#if TPCC_PHANTOM_AVOIDANCE && TPCC_PHANTOM_AVOIDANCE_ALG == PHANTOM_LOCK
+	assert(index->table->ex_lock_owner == txn_id); // i'm holding the lock
+#endif
+
+#if !SIMPLE_INDEX_UPDATE
+  auto rc_insert = index->index_insert(this, key, row, part_id);
+
+  if (rc_insert != RCOK)
+    return false;
+#endif  // SIMPLE_INDEX_UPDATE
+
+	if(!g_log_recover)
+	{
+		assert(insert_idx_cnt < MAX_ROW_PER_TXN);
+		insert_idx_idx[insert_idx_cnt] = index;
+		insert_idx_id[insert_idx_cnt] = index_id;
+		insert_idx_key[insert_idx_cnt] = key;
+		insert_idx_row[insert_idx_cnt] = row;
+		int i;
+		for(i=insert_cnt-1; i>=0; i--)
+			if(insert_rows[i] == row)
+			{
+				insert_idx_row_id[insert_idx_cnt] = i;
+				break;
+			}
+		if(i<0){
+			// insert a index without inserting the row first.
+			assert(false);
+		}
+		insert_idx_part_id[insert_idx_cnt] = part_id;
+		insert_idx_cnt++;
+	}
+  return true;
+}
+
+
+template <>
+bool txn_man::remove_idx(ORDERED_INDEX* index, uint64_t key, row_t* row,
+                            int part_id, int index_id) {
+	if(!g_log_recover)
+	// we need to remove idx also in the recovery
+	{ // we do lazy remove
+
+		for(uint32_t i=0; i<remove_idx_cnt; i++)
+		{
+			if(remove_idx_key[i] == key && remove_idx_id[i] == index_id)
+				return true; // already marked as removed
+		}
+
+	(void)row;
+		assert(remove_idx_cnt < MAX_ROW_PER_TXN);
+		remove_idx_idx[remove_idx_cnt] = index;
+		remove_idx_id[remove_idx_cnt] = index_id;
+		remove_idx_key[remove_idx_cnt] = key;
+		remove_idx_part_id[remove_idx_cnt] = part_id;
+		remove_idx_cnt++;
+	}
+	else
+	{
+		// remove the index right away
+		index->index_remove(this, key, row, part_id);
+	}
+	
+  return true;
+}
+
+template <typename IndexT>
+void txn_man::index_read(IndexT * index, idx_key_t key, int part_id, itemid_t *& item)
+{
+	index->index_read(key, item, part_id, get_thd_id());
+}
+
+// template instantiation
+template
+void txn_man::index_read(HASH_INDEX* index, idx_key_t key, int part_id, itemid_t *& item);
+
+template
+itemid_t* txn_man::index_read(HASH_INDEX* index, idx_key_t key, int part_id);
+template
+RC txn_man::index_read(HASH_INDEX* index, idx_key_t key, row_t** row, int part_id);
+template
+RC txn_man::index_read_multiple(HASH_INDEX* index, idx_key_t key, row_t** rows, size_t& count, int part_id);
+template
+RC txn_man::index_read_range(HASH_INDEX* index, idx_key_t min_key, idx_key_t max_key, row_t** rows, size_t& count, int part_id);
+template
+RC txn_man::index_read_range_rev(HASH_INDEX* index, idx_key_t min_key, idx_key_t max_key, row_t** rows, size_t& count, int part_id);
+
+template
+RC txn_man::index_read(ARRAY_INDEX* index, idx_key_t key, row_t** row, int part_id);
+template
+RC txn_man::index_read_multiple(ARRAY_INDEX* index, idx_key_t key, row_t** rows, size_t& count, int part_id);
+template
+RC txn_man::index_read_range(ARRAY_INDEX* index, idx_key_t min_key, idx_key_t max_key, row_t** rows, size_t& count, int part_id);
+template
+RC txn_man::index_read_range_rev(ARRAY_INDEX* index, idx_key_t min_key, idx_key_t max_key, row_t** rows, size_t& count, int part_id);
+
+template
+RC txn_man::index_read(ORDERED_INDEX* index, idx_key_t key, row_t** row, int part_id);
+template
+RC txn_man::index_read_multiple(ORDERED_INDEX* index, idx_key_t key, row_t** rows, size_t& count, int part_id);
+template
+RC txn_man::index_read_range(ORDERED_INDEX* index, idx_key_t min_key, idx_key_t max_key, row_t** rows, size_t& count, int part_id);
+template
+RC txn_man::index_read_range_rev(ORDERED_INDEX* index, idx_key_t min_key, idx_key_t max_key, row_t** rows, size_t& count, int part_id);
+
+template
+row_t* txn_man::search(HASH_INDEX* index, uint64_t key, int part_id, access_t type, bool skip_read);
+
+template
+row_t* txn_man::search(ORDERED_INDEX* index, uint64_t key, int part_id, access_t type, bool skip_read);

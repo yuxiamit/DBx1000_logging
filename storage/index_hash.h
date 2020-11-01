@@ -3,6 +3,7 @@
 #include "global.h"
 #include "helper.h"
 #include "index_base.h"
+#include "txn.h"
 
 //TODO make proper variables private
 // each BucketNode contains items sharing the same key
@@ -44,10 +45,28 @@ public:
 	bool 		index_exist(idx_key_t key); // check if the key exist.
 	RC 			index_insert(idx_key_t key, itemid_t * item, int part_id=-1);
 	RC 			index_insert(idx_key_t key, itemid_t * item, int part_id, void * node_mem);
+	RC			index_insert(IndexHash* index, uint64_t key, row_t* row, int part_id);
 	// the following call returns a single item
 	RC	 		index_read(idx_key_t key, itemid_t * &item, int part_id=-1);	
 	RC	 		index_read(idx_key_t key, itemid_t * &item, 
 							int part_id=-1, int thd_id=0);
+	RC			index_read(txn_man* txn, idx_key_t key, row_t** row, int part_id);
+	RC 			index_read_multiple(txn_man* txn, idx_key_t key, row_t** rows, size_t& count,
+                         int part_id);
+
+	RC 			index_read_range(txn_man* txn, idx_key_t min_key, idx_key_t max_key, row_t** rows,
+						size_t& count, int part_id) {
+		// Not implemented.
+		assert(false);
+		return ERROR;
+	}
+	RC 			index_read_range_rev(txn_man* txn, idx_key_t min_key, idx_key_t max_key, row_t** rows,
+							size_t& count, int part_id) {
+		// Not implemented.
+		assert(false);
+		return ERROR;
+	}
+	
 private:
 	void get_latch(BucketHeader * bucket);
 	void release_latch(BucketHeader * bucket);

@@ -19,7 +19,6 @@
 #include <helper.h>
 #include "manager.h"
 #include <inttypes.h>
-#include "numa.h"
 
 //int volatile count_busy = g_buffer_size;
 
@@ -33,31 +32,31 @@ LogManager::LogManager(uint32_t logger_id)
 		next_lsn = 0;
 		disk_lsn = 0;
 #else		
-		_disk_lsn = (uint64_t *) MALLOC(sizeof(uint64_t), logger_id);
+		_disk_lsn = (uint64_t *) _mm_malloc(sizeof(uint64_t), ALIGN_SIZE);
 		*_disk_lsn = 0;
-		_next_lsn = (uint64_t *) MALLOC(sizeof(uint64_t), logger_id);
+		_next_lsn = (uint64_t *) _mm_malloc(sizeof(uint64_t), ALIGN_SIZE);
 		*_next_lsn = 0;
 #endif
 #if LOG_ALGORITHM != LOG_TAURUS
 		_gc_lsn = new uint64_t volatile * [g_thread_cnt];
 		for (uint32_t i = 0; i < g_thread_cnt; i++) {
-			_gc_lsn[i] = (uint64_t *) MALLOC(sizeof(uint64_t), logger_id);
+			_gc_lsn[i] = (uint64_t *) _mm_malloc(sizeof(uint64_t), ALIGN_SIZE);
 			*_gc_lsn[i] = 0;
 		}
 #else
 		uint64_t num_worker = g_thread_cnt / g_num_logger;
-		rasterizedLSN = (volatile uint64_t**) MALLOC(sizeof(uint64_t*) * num_worker, logger_id);
+		rasterizedLSN = (volatile uint64_t**) _mm_malloc(sizeof(uint64_t*) * num_worker, 64);
 		for(uint i=0; i<num_worker; i++)
 		{
-			rasterizedLSN[i] = (volatile uint64_t*) MALLOC(sizeof(uint64_t), logger_id);
+			rasterizedLSN[i] = (volatile uint64_t*) _mm_malloc(sizeof(uint64_t), 64);
 			rasterizedLSN[i][0] = 0;
 		}
 		
 		#if PER_WORKER_RECOVERY
-		reserveLSN = (volatile uint64_t**) MALLOC(sizeof(uint64_t*) * num_worker, logger_id);
+		reserveLSN = (volatile uint64_t**) _mm_malloc(sizeof(uint64_t*) * num_worker, 64);
 		for(uint i=0; i<num_worker; i++)
 		{
-			reserveLSN[i] = (volatile uint64_t*) MALLOC(sizeof(uint64_t), logger_id);
+			reserveLSN[i] = (volatile uint64_t*) _mm_malloc(sizeof(uint64_t), 64);
 			reserveLSN[i][0] = 0;
 		}
 		#endif
@@ -66,18 +65,22 @@ LogManager::LogManager(uint32_t logger_id)
 #endif
 		_eof = false;
 		
-	} else {
 		
+	} else {
+		//assert(g_thread_cnt <= 64); // see log.h
+		//_lsn = (uint64_t *) _mm_malloc(sizeof(uint64_t), ALIGN_SIZE);
+		//_persistent_lsn = (uint64_t *) _mm_malloc(sizeof(uint64_t), ALIGN_SIZE);
 		*_lsn = 0;
 		*_persistent_lsn = 0;
-		
+		//assert(g_num_logger + g_thread_cnt <= 64); // for the filled_lsn and allocate_lsn
+		//_filled_lsn = (volatile uint64_t**) _mm_malloc(sizeof(uint64_t*) * g_thread_cnt, ALIGN_SIZE); //new uint64_t volatile * [g_thread_cnt];
 		for (uint32_t i = 0; i < g_thread_cnt; i++) {
-			_filled_lsn[i] = (uint64_t *) MALLOC(sizeof(uint64_t), logger_id);
-			*_filled_lsn[i] = 0; 
+			_filled_lsn[i] = (uint64_t *) _mm_malloc(sizeof(uint64_t), ALIGN_SIZE);
+			*_filled_lsn[i] = 0; //(uint64_t) -1;  // initial value to make sure that allocate_lsn >= filled_lsn is not true
 		}
 #if SOLVE_LIVELOCK
 		for (uint32_t i = 0; i < g_thread_cnt; i++) {
-			_allocate_lsn[i] = (uint64_t *) MALLOC(sizeof(uint64_t), logger_id);
+			_allocate_lsn[i] = (uint64_t *) _mm_malloc(sizeof(uint64_t), ALIGN_SIZE);
 			*_allocate_lsn[i] = (uint64_t) -1;
 		}
 #endif
@@ -89,18 +92,16 @@ LogManager::LogManager(uint32_t logger_id)
 		_flush_interval = UINT64_MAX; // flush interval turned off
 	else
 		_flush_interval = g_flush_interval; // in ns  
-	_last_flush_time = (uint64_t *) MALLOC(sizeof(uint64_t), logger_id);
+	_last_flush_time = (uint64_t *) _mm_malloc(sizeof(uint64_t), ALIGN_SIZE);
 	COMPILER_BARRIER
 	*_last_flush_time = get_sys_clock();
+	
+	// log buffer
+	
+	// TODO: need to adapt different settings for the 4-th logger on a RAID 5 disk.
 
-#if LOG_ALGORITHM == LOG_PLOVER
-	plover_ready_lsn = 0;
-#endif
-
-	_buffer = (char *) numa_alloc_onnode(_log_buffer_size + g_max_log_entry_size, (logger_id % g_num_logger) % NUMA_NODE_NUM);
-
+	_buffer = (char *) _mm_malloc(_log_buffer_size + g_max_log_entry_size, 512); // logical block size of the file system
     cout << "Log buffer size " << _log_buffer_size << endl;
-	assert(_buffer != 0);
 }
 
 LogManager::~LogManager()
@@ -111,14 +112,18 @@ LogManager::~LogManager()
 	delete _disk;
 #else 
 	if (!g_log_recover && !g_no_flush) {
+		//return; // TODO: potential future TODOs.
+		// we just ignore the following epoch.
 		
+		// What if someone is still copying data?
+		//cout << "!!!" << endl;
 		printf("Destructor %d. flush size=%" PRIu64 " (%" PRIu64 " to %" PRIu64 ")\n", _logger_id, (*_lsn) / 512 * 512 - *_persistent_lsn, 
 			*_persistent_lsn, (*_lsn) / 512 * 512);
 		uint64_t end_lsn = (*_lsn) / 512 * 512;
 		uint64_t start_lsn = *_persistent_lsn;
 		if(end_lsn > start_lsn)
 			flush(start_lsn, end_lsn);
-		INC_FLOAT_STATS_V0(log_bytes, end_lsn - start_lsn);
+		INC_FLOAT_STATS(log_bytes, end_lsn - start_lsn);
 			
 		uint32_t bytes = write(_fd, &end_lsn, sizeof(uint64_t));
 		//uint32_t bytes = write(_fd, _lsn, sizeof(uint64_t));
@@ -128,9 +133,7 @@ LogManager::~LogManager()
 		close(_fd);
 		close(_fd_data);
 	}
-	
-	//_mm_free(_buffer); // because this could be very big.
-	numa_free((void*)_buffer, _log_buffer_size + g_max_log_entry_size);
+	_mm_free(_buffer); // because this could be very big.
 #endif
 }
 
@@ -162,7 +165,7 @@ void LogManager::init(string log_file_name)
 			lseek(_fd, 0, SEEK_SET);
 			_num_chunks = fsize / sizeof(uint64_t);
 			//_starting_lsns = new uint64_t [_num_chunks];
-			_starting_lsns = (uint64_t*) MALLOC(_num_chunks * sizeof(uint64_t), GET_THD_ID);
+			_starting_lsns = (uint64_t*) _mm_malloc(_num_chunks * sizeof(uint64_t), ALIGN_SIZE);
 			uint32_t size = read(_fd, _starting_lsns, fsize);
 			assert(size == fsize);
 			_chunk_size = 0;
@@ -180,12 +183,14 @@ void LogManager::init(string log_file_name)
 					_chunk_size = fend - fstart;
 				printf("_starting_lsns[%d] = %" PRIu64 "\n", i, _starting_lsns[i]);
 			}
-			
+			// let the profiling tool only measures the all-thread-busy-working part.
+			//uint32_t worker_per_logger = g_thread_cnt / g_num_logger;
+			//_num_chunks = (_num_chunks - 1) / worker_per_logger * worker_per_logger + 1;
 			printf("Chunk Number adjusted to %d\n", _num_chunks);
 
 			_chunk_size = _chunk_size / 512 * 512 + 1024;
 			close(_fd);
-            _next_chunk = (uint32_t*) MALLOC(sizeof(uint32_t), GET_THD_ID);
+            _next_chunk = (uint32_t*) _mm_malloc(sizeof(uint32_t), ALIGN_SIZE);
 			*_next_chunk = 0; //_num_chunks - 1; //_num_chunks-1; // start from end
 			_file_size = fsize;
 
@@ -198,28 +203,34 @@ void LogManager::init(string log_file_name)
 			lastTime = 0;
 			AIOworking = false;
 #endif
-		
+		//}
+		//_mutex = new pthread_mutex_t;
+		//pthread_mutex_init(_mutex, NULL);
+//#endif
 	} else {
 		//cout << log_file_name << endl;
 		string name = _file_name;
 	    // for parallel logging. The metafile format.
 		//  | file_id | start_lsn | * num_of_log_files
 		_fd = open(name.c_str(), O_TRUNC | O_WRONLY | O_CREAT, 0664);
-	 
+	 // #if LOG_ALGORITHM == LOG_PARALLEL
+		//_fd = open(name.c_str(), O_TRUNC | O_WRONLY | O_CREAT, 0664);
+		//uint32_t bytes = write(_fd, &_curr_file_id, sizeof(_curr_file_id));
+		// the start of the first segment. _lsn = 0 
 		assert(*_lsn  == 0);
 		uint32_t bytes = write(_fd, (uint64_t*)_lsn, sizeof(uint64_t));
 		assert(bytes == sizeof(uint64_t));
 		fsync(_fd);
-	 
+	 // #endif
 		assert(_fd != -1);
-
+//	  #if LOG_ALGORITHM == LOG_PARALLEL
 		name = _file_name + ".0"; // + to_string(_curr_file_id);
 		if(g_ramdisk)
 			_fd_data = open(name.c_str(), O_TRUNC | O_WRONLY | O_CREAT, 0664);
 		else
 			_fd_data = open(name.c_str(), O_DIRECT | O_TRUNC | O_WRONLY | O_CREAT, 0664);
 		assert(_fd_data != -1);
-
+//	  #endif
 	}
 }
 
@@ -230,10 +241,19 @@ LogManager::logTxn(char * log_entry, uint32_t size, uint64_t epoch, bool sync)
 	// The log is stored to the in memory cirular buffer
     // if the log buffer is full, wait for it to flush.  
 		
-	//assert( *(uint32_t*)log_entry == 0xbeef);
-
 	//printf("TPCC log size: %d\n", size);
 	//COMPILER_BARRIER;
+
+	// NOTE: probably the condition check below is a bit too conservative
+	// but this can guarantee the atomic_add will succeed.
+	// so we can perform changes to allocated_lsn before we do the addition to lsn
+	// this is critical to the correctness.
+	// This conservative check could block the logger from making progress if
+	// g_max_log_entry_size * g_thread_cnt / g_num_logger > g_log_buffer_size / 2
+	// because the log writer will not write them to the disk.
+
+	// However, alternatively, we can use ATOM_CAS to let _lsn - persistent_lsn be always
+	// smaller than log_buffer_size. 
 	uint64_t starttime = get_sys_clock();
 	if (*_lsn + size >= 
 		*_persistent_lsn + _log_buffer_size - g_max_log_entry_size * g_thread_cnt / g_num_logger) 
@@ -250,6 +270,9 @@ LogManager::logTxn(char * log_entry, uint32_t size, uint64_t epoch, bool sync)
 		//assert(false);
 		return -1; 
 	}
+
+//INC_INT_STATS(time_debug3, get_sys_clock() - starttime);	
+//INC_INT_STATS(time_debug10, get_sys_clock() - starttime);	
 	uint32_t size_aligned = size % 64 == 0 ? size: size + 64 - size % 64;
 	//INC_INT_STATS(time_debug6, get_sys_clock() - starttime);
 	#if SOLVE_LIVELOCK
@@ -263,14 +286,19 @@ LogManager::logTxn(char * log_entry, uint32_t size, uint64_t epoch, bool sync)
   		lsn = ATOM_FETCH_ADD(*_lsn, size_aligned);	
 	else
 	{
-		assert(LOG_ALGORITHM == LOG_SERIAL || LOG_ALGORITHM == LOG_PLOVER); // only serial logging puts this code in a critical section.	
+		assert(LOG_ALGORITHM == LOG_SERIAL); // only serial logging puts this code in a critical section.
+
 		lsn = *_lsn;
-#if LOG_ALGORITHM == LOG_PLOVER
-		plover_ready_lsn = lsn;
-		COMPILER_BARRIER
-#endif
 		*_lsn += size_aligned;
 	}
+	
+	//COMPILER_BARRIER
+	//INC_INT_STATS(time_debug7, get_sys_clock() - starttime);
+//COMPILER_BARRIER;
+	//uint64_t lsn = ATOM_FETCH_ADD(*_lsn, size);
+
+//INC_INT_STATS(time_debug8, get_sys_clock() - starttime);
+
 	
 	if ((lsn / _log_buffer_size < (lsn + size) / _log_buffer_size))	{
 		// reaching the end of the circular buffer, write in two steps 
@@ -281,8 +309,13 @@ LogManager::logTxn(char * log_entry, uint32_t size, uint64_t epoch, bool sync)
 		memcpy(_buffer + lsn % _log_buffer_size, log_entry, size);
 	}
 	COMPILER_BARRIER
-	INC_INT_STATS(time_insideSLT1, get_sys_clock() - starttime);
+INC_INT_STATS(time_insideSLT1, get_sys_clock() - starttime);
 	
+//INC_INT_STATS(time_insideSLT2, get_sys_clock() - starttime);
+	//////////// DEBUG
+	//uint32_t size_entry = *(uint32_t*)(log_entry + sizeof(uint32_t));
+	//assert(size == size_entry && size > 0 && size <= g_max_log_entry_size);
+	/////////////////////
   #if LOG_ALGORITHM == LOG_BATCH
 	glob_manager->update_epoch_lsn_mapping(epoch, lsn);
   #endif
@@ -292,10 +325,15 @@ LogManager::logTxn(char * log_entry, uint32_t size, uint64_t epoch, bool sync)
 			log_filled_lsn = -1;  // set as -1 to inactivate
 		else
 	#endif
-
+//INC_INT_STATS(time_debug4, get_sys_clock() - starttime);
+		/*
+		stringstream ss;
+		ss<<GET_THD_ID << " " << (uint64_t)(_filled_lsn[GET_THD_ID]) << endl;
+		cout << ss.str();
+		*/
 		*(_filled_lsn[GET_THD_ID]) = lsn + size_aligned; 
-
-	INC_INT_STATS(time_insideSLT2, get_sys_clock() - starttime);
+//INC_INT_STATS(time_debug5, get_sys_clock() - starttime);
+INC_INT_STATS(time_insideSLT2, get_sys_clock() - starttime);
   	return lsn + size; // or it could be lsn+size_aligned-1
 }
 //#endif
@@ -309,23 +347,22 @@ LogManager::tryFlush()
 		*_persistent_lsn = *_lsn;
 		return size;
 	}
+	//assert(false);
+	//#if SOLVE_LIVELOCK
 	uint64_t ready_lsn = *_lsn;
-#if LOG_ALGORITHM == LOG_PLOVER
-	// determine ready_lsn
-	ready_lsn = plover_ready_lsn;
-#else
 #if LOG_ALGORITHM == LOG_TAURUS && COMPRESS_LSN_LOG
 	if(log_filled_lsn != (uint64_t)-1 && ready_lsn > log_filled_lsn)
 		ready_lsn = log_filled_lsn;
 #endif
-	
+	//#else
+	//uint64_t ready_lsn = *_filled_lsn[_logger_id];  // note that logger_id could be larger than g_thread_cnt!
+	//#endif
+	//printf("_lsn = %ld\n", *_lsn);
 	COMPILER_BARRIER
 	#if SOLVE_LIVELOCK
-#if PARTITION_AWARE
-	for (uint32_t i = 0; i < g_thread_cnt; i++) // because any worker could write to this log
-#else
 	for (uint32_t i = _logger_id; i < g_thread_cnt; i+= g_num_logger)
-#endif	
+		// ready_lsn is the smallest lsn
+		//if (i % g_num_logger == _logger_id && ready_lsn > *_filled_lsn[i]) {
 	{
 		uint64_t filledLSN = *_filled_lsn[i]; // the reading order matters
 		COMPILER_BARRIER
@@ -335,11 +372,7 @@ LogManager::tryFlush()
 		}
 	}
 	#else
-#if PARTITION_AWARE
-	for (uint32_t i = 0; i < g_thread_cnt; i++) // because any worker could write to this log
-#else
 	for (uint32_t i = _logger_id; i < g_thread_cnt; i+= g_num_logger)
-#endif
 		if (ready_lsn > *_filled_lsn[i]) {
 			ready_lsn = *_filled_lsn[i];
 		}
@@ -351,14 +384,14 @@ LogManager::tryFlush()
 		if(log_filled_lsn > 0 && ready_lsn > log_filled_lsn)
 			ready_lsn = log_filled_lsn;
 	#endif
-#endif
 
+	// Flush to disk if 1) it's been long enough since last flush. OR 2) the buffer is full enough. 
 	if (get_sys_clock() - *_last_flush_time < _flush_interval &&
-	    ready_lsn - *_persistent_lsn < g_flush_blocksize) 
+	    ready_lsn - *_persistent_lsn < _log_buffer_size / 2) 
 	{	
 		return 0;
 	}
-	if(ready_lsn - *_persistent_lsn < g_flush_blocksize)
+	if(ready_lsn - *_persistent_lsn < _log_buffer_size / 2)
 	{
 		INC_INT_STATS(int_flush_time_interval, 1); // caused by time larger than _flush_interval
 	}
@@ -366,16 +399,17 @@ LogManager::tryFlush()
 	{
 		INC_INT_STATS(int_flush_half_full, 1); // caused by half full buffer
 	}
-
 	assert(ready_lsn >= *_persistent_lsn);
 	// timeout or buffer full enough.
 	*_last_flush_time = get_sys_clock();
+
+	//ready_lsn -= ready_lsn % 512; 
+	//assert(*_persistent_lsn % 512 == 0);
 	
 	uint64_t start_lsn = *_persistent_lsn;
 	uint64_t end_lsn = ready_lsn - ready_lsn % 512; // round to smaller 512x
-
-	if(end_lsn - start_lsn > g_flush_blocksize)
-		end_lsn = start_lsn + g_flush_blocksize;
+	//if(end_lsn == *_persistent_lsn) end_lsn = ready_lsn; // small progress could happen when TPCC high contention.
+	/*******************************/
 
 #if WITHOLD_LOG
 	//nanosleep((const struct timespec[]){{0, 32000L}}, NULL);  // do nothing
@@ -389,7 +423,7 @@ LogManager::tryFlush()
 #if LOG_ALGORITHM == LOG_BATCH
 	glob_manager->update_persistent_epoch(_logger_id, end_lsn);
 #endif
-#if !(LOG_ALGORITHM == LOG_TAURUS && !TAURUS_CHUNK) // taurus does not need this.
+#if LOG_ALGORITHM != LOG_TAURUS // taurus does not need this.
 	uint32_t chunk_size = g_log_chunk_size;// _log_buffer_size 
 	if (end_lsn / chunk_size  > start_lsn / chunk_size ) {
 		// write ready_lsn into the file.
@@ -398,7 +432,7 @@ LogManager::tryFlush()
 		assert(bytes == sizeof(ready_lsn));
 		fsync(_fd);
 	}
-#endif
+	#endif
 	return end_lsn - start_lsn;
 }
 
@@ -424,8 +458,6 @@ LogManager::flush(uint64_t start_lsn, uint64_t end_lsn)
 		// here an error might occur that, the serial port (SATA) might be being used by another one.
 		// where the error number would be 
 		bytes = write(_fd_data, (void *)(_buffer + start_lsn % _log_buffer_size), end_lsn - start_lsn);
-		// When using RAID0, sometimes only 2147479552 bytes are written
-
 		M_ASSERT(bytes == end_lsn - start_lsn, "bytes=%d, planned=%" PRIu64 ", errno=%d, _fd=%d, end_lsn=%" PRIu64 ", start_lsn=%" PRIu64 ", data=%" PRIu64 "\n", 
 			bytes, end_lsn - start_lsn, errno, _fd_data, end_lsn, start_lsn, (uint64_t)(_buffer));
 		//printf("start_lsn = %ld, end_lsn = %ld\n", start_lsn, end_lsn);
@@ -434,7 +466,7 @@ LogManager::flush(uint64_t start_lsn, uint64_t end_lsn)
 	INC_INT_STATS(int_debug2, bytes);
 	INC_INT_STATS(int_debug3, 1);
 	fsync(_fd_data); // sync the data
-	INC_INT_STATS_V0(time_io, get_sys_clock() - starttime); // actual time in flush.
+	INC_INT_STATS(time_io, get_sys_clock() - starttime); // actual time in flush.
 //#endif
 }
 
@@ -444,7 +476,7 @@ LogManager::tryReadLog()
 {
 	uint64_t bytes, start_lsn_moded, end_lsn_moded;
 	bytes = 0;
-#if ASYNC_IO
+	#if ASYNC_IO
 	if(AIOworking){
 		// short-cut tryReadLog function if the previous is till working
 		if(aio_error64(&cb) == EINPROGRESS)
@@ -475,19 +507,18 @@ LogManager::tryReadLog()
 #endif
 		INC_INT_STATS(int_flush_half_full, 1);
 		INC_INT_STATS(log_data, bytes);
-		INC_INT_STATS_V0(time_io, get_sys_clock() - lastTime);
+		INC_INT_STATS(time_io, get_sys_clock() - lastTime);
 	}
 	
 	
-#endif
+	#endif
 	uint64_t starttime = get_sys_clock();
 //#if LOG_ALGORITHM != LOG_BATCH
 #if LOG_ALGORITHM != LOG_TAURUS
 	uint64_t gc_lsn = *_next_lsn;
 	COMPILER_BARRIER
-	for (uint32_t i = _logger_id; i < g_thread_cnt; i+=g_num_logger)
-		if (gc_lsn > *_gc_lsn[i] && *_gc_lsn[i] != 0) {
-		//if (i % g_num_logger == _logger_id && gc_lsn > *_gc_lsn[i] && *_gc_lsn[i] != 0) {
+	for (uint32_t i = 0; i < g_thread_cnt; i++)
+		if (i % g_num_logger == _logger_id && gc_lsn > *_gc_lsn[i] && *_gc_lsn[i] != 0) {
 			gc_lsn = *_gc_lsn[i];
 		}
 	assert(gc_lsn <= *_disk_lsn);
@@ -503,12 +534,15 @@ LogManager::tryReadLog()
 	uint64_t gc_lsn = *_next_lsn;
 	for(uint i=0; i<num_worker; i++)
 	{
+		//if(reserveLSN[i][0] && gc_lsn > rasterizedLSN[i][0])
+		//if(gc_lsn > rasterizedLSN[i][0])
+		//	gc_lsn = rasterizedLSN[i][0];
 		uint64_t rlsn = reserveLSN[i][0];
 		if(rlsn > 0 && gc_lsn > rlsn)
 			gc_lsn = rlsn;
 	}
 	assert(gc_lsn <= *_disk_lsn);
-	
+	//uint64_t gc_lsn = rasterizedLSN[0]; // *log_manager->recoverLVSPSC_min[GET_THD_ID % g_num_logger]; // *_next_lsn;
 	if (*_disk_lsn - gc_lsn > _log_buffer_size / 2) 
 	{
 		//AIOworking = false;
@@ -528,7 +562,7 @@ LogManager::tryReadLog()
 			gc_lsn = rasterizedLSN[i][0];
 	}
 	assert(gc_lsn <= disk_lsn);
-	
+	//uint64_t gc_lsn = rasterizedLSN[0]; // *log_manager->recoverLVSPSC_min[GET_THD_ID % g_num_logger]; // *_next_lsn;
 	if (disk_lsn - gc_lsn > _log_buffer_size / 2)
 	{
 		//AIOworking = false;
@@ -551,14 +585,14 @@ LogManager::tryReadLog()
 		
 	gc_lsn -= gc_lsn % 512; 
 
-	
-	uint64_t budget = g_read_blocksize; //(uint64_t)(_log_buffer_size * g_recover_buffer_perc);
-	uint64_t end_lsn = start_lsn + budget;
-	if (end_lsn - gc_lsn >= _log_buffer_size)
-		end_lsn = gc_lsn + _log_buffer_size - 512;
-	
+	uint64_t budget = (uint64_t)(_log_buffer_size * g_recover_buffer_perc);
+	uint64_t end_lsn = gc_lsn + budget;
+	//#if LOG_TYPE == LOG_COMMAND // not suitable for disk bounded LOG_DATA
 	if (end_lsn - start_lsn < budget / 2) // we need to control the amount of bytes every time
 		return bytes;
+	//#endif
+	//#endif
+    //cout << _logger_id << " " << budget << " " << end_lsn << " " << start_lsn << " " << end_lsn - start_lsn << endl;
 	
 	//uint64_t end_lsn = gc_lsn + (uint64_t)(_log_buffer_size * g_recover_buffer_perc);
 	if (start_lsn == end_lsn) return bytes;
@@ -639,10 +673,9 @@ LogManager::tryReadLog()
 #endif
 	INC_INT_STATS(int_debug3, 1);
 	INC_INT_STATS(int_debug2, bytes);
-	INC_INT_STATS_V0(time_io, get_sys_clock() - starttime);
 #endif
     INC_INT_STATS(int_debug1, 1); // how many time we initiate the AIO.
-	INC_INT_STATS(time_debug10, get_sys_clock() - starttime); // actual time in read.
+	INC_INT_STATS(time_debug10, get_sys_clock() - starttime); // actual time in flush.
 	return bytes;
 /*#else 
 	assert(false);
@@ -665,7 +698,7 @@ uint64_t LogManager::get_next_log_entry_non_atom(char * &entry) //, uint32_t &my
 		// is corrupted? the assertion in txn.cpp : 449 would fail.
 		// Right now, the hack to solve this bug:
 		//  	do not read the last few blocks.
-		uint32_t dead_tail = 0;// _eof? 2048 : 0;
+		uint32_t dead_tail = _eof? 2048 : 0;
 #if LOG_ALGORITHM == LOG_SERIAL
 		if (UNLIKELY(*_next_lsn + sizeof(uint32_t) * 2 >= *_disk_lsn - dead_tail)) {
 #else // it could be taurus if per_worker_recover is turned off
@@ -679,14 +712,15 @@ uint64_t LogManager::get_next_log_entry_non_atom(char * &entry) //, uint32_t &my
 		// Each log record has the following format
 		//  | checksum (32 bit) | size (32 bit) | ...
 
+		//uint64_t t2 = get_sys_clock();
+		// handle the boundary case.
+		//uint32_t size_offset = (next_lsn + sizeof(uint32_t)) % _log_buffer_size;
 #if LOG_ALGORITHM == LOG_SERIAL
 		uint64_t size_offset = *_next_lsn % _log_buffer_size + sizeof(uint32_t);
 #else
 		uint64_t size_offset = next_lsn % _log_buffer_size + sizeof(uint32_t);
 #endif
-		
-			size = *(uint32_t*) (_buffer + size_offset);
-			//mysize = size;
+		size = *(uint32_t*) (_buffer + size_offset);
 		
 		// round to a cacheline size
 		size = size % 64 == 0 ? size : size + 64 - size % 64;
@@ -729,23 +763,16 @@ uint64_t LogManager::get_next_log_entry_non_atom(char * &entry) //, uint32_t &my
 uint64_t 
 LogManager::get_next_log_entry(char * &entry, uint32_t & callback_size)
 {
-#if (LOG_ALGORITHM == LOG_TAURUS && PER_WORKER_RECOVERY) || LOG_ALGORITHM == LOG_PLOVER
+#if LOG_ALGORITHM == LOG_TAURUS && PER_WORKER_RECOVERY
 	uint64_t next_lsn;
 	uint32_t size;
 	uint32_t size_aligned;
 	//char * mentry = entry;
 	uint64_t t1 = get_sys_clock();
+	uint64_t workerId = GET_THD_ID / g_num_logger;
 	for(;;) {
 		//mentry = entry;
-#if LOG_ALGORITHM == LOG_TAURUS
-		uint64_t workerId = GET_THD_ID / g_num_logger;
 		reserveLSN[workerId][0] = 0;
-#endif
-
-#if LOG_ALGORITHM == LOG_PLOVER
-		uint64_t workerId = GET_THD_ID / g_num_logger;
-		_gc_lsn[workerId][0] = *_next_lsn; // update to latest
-#endif
 		next_lsn = *_next_lsn;
 		//rasterizedLSN[workerId][0] = next_lsn;
     
@@ -754,7 +781,7 @@ LogManager::get_next_log_entry(char * &entry, uint32_t & callback_size)
 		// is corrupted? the assertion in txn.cpp : 449 would fail.
 		// Right now, the hack to solve this bug:
 		//  	do not read the last few blocks.
-		uint32_t dead_tail = 0; //_eof? 2048 : 0;
+		uint32_t dead_tail = _eof? 2048 : 0;
 		if (UNLIKELY(next_lsn + sizeof(uint32_t) * 2 >= *_disk_lsn - dead_tail)) {
 			//cout << "next " << next_lsn << " " << *_disk_lsn << endl;
 			entry = NULL;
@@ -765,10 +792,14 @@ LogManager::get_next_log_entry(char * &entry, uint32_t & callback_size)
 		// Each log record has the following format
 		//  | checksum (32 bit) | size (32 bit) | ...
 
-		
+		//uint64_t t2 = get_sys_clock();
+		// handle the boundary case.
+		// uint32_t size_offset = (next_lsn + sizeof(uint32_t)) % _log_buffer_size;
+		//if(*_next_lsn != next_lsn) continue;
 		uint32_t size_offset = next_lsn % _log_buffer_size + sizeof(uint32_t);
 		
-		size = *(uint32_t*) (_buffer + size_offset);
+			//memcpy(&size, _buffer + size_offset, sizeof(uint32_t));
+			size = *(uint32_t*) (_buffer + size_offset);
 		//if(*_next_lsn != next_lsn) continue;
 			// round to a cacheline size
 		size_aligned = size % 64 == 0 ? size : size + 64 - size % 64;
@@ -780,9 +811,7 @@ LogManager::get_next_log_entry(char * &entry, uint32_t & callback_size)
 		}
 		if(*_next_lsn != next_lsn) continue;
 		//INC_INT_STATS(int_debug5, 1);
-#if LOG_ALGORITHM == LOG_TAURUS
 		reserveLSN[workerId][0] = next_lsn; // + size_aligned;
-#endif
 		//rasterizedLSN[workerId][0] = *_next_lsn;
 		COMPILER_BARRIER
 		if(ATOM_CAS(*_next_lsn, next_lsn, next_lsn + size_aligned))
@@ -793,11 +822,9 @@ LogManager::get_next_log_entry(char * &entry, uint32_t & callback_size)
 	}
 	INC_INT_STATS(time_debug5, get_sys_clock() - t1);
 	INC_INT_STATS(int_debug6, 1);
+	
+	entry = _buffer + (next_lsn % _log_buffer_size);
 
-		//mentry = _buffer + (next_lsn % _log_buffer_size);
-		entry = _buffer + (next_lsn % _log_buffer_size);
-
-	//entry = mentry;
 	next_lsn = next_lsn + size;
 	callback_size = size;
 	INC_INT_STATS(int_debug_get_next, 1);	
@@ -815,91 +842,19 @@ LogManager::get_next_log_batch(char * &entry, uint32_t & num)
 	assert(false); // not implemented
 }
  
-#if ASYNC_IO && !WORK_IN_PROGRESS
-uint32_t
-LogManager::get_next_log_chunk(char * &chunk, char * other_chunk, uint64_t &size, uint64_t &lastTime, aiocb64 &cb, bool &AIOworking, bool &ready, uint32_t &chunk_num, uint64_t &lastLSN)
-{
-#if LOG_ALGORITHM == LOG_PARALLEL || LOG_ALGORITHM == LOG_BATCH || (LOG_ALGORITHM == LOG_TAURUS && TAURUS_CHUNK)
-    uint64_t start = get_sys_clock();
-	uint64_t bytes = 0;
-	
-	if (AIOworking) {
-		if(aio_error64(&cb) == EINPROGRESS)
-		{
-			size = 0;
-			return -1;
-		}
-		bytes = aio_return64(&cb);
-		size = bytes;
-		AIOworking = false;
-		ready = true;
-		close(cb.fildes);
-		chunk = chunk + lastLSN % 512;
-		INC_INT_STATS(int_flush_half_full, 1);
-		INC_INT_STATS(log_data, bytes);
-		INC_INT_STATS_V0(time_io, get_sys_clock() - lastTime);
-		return 0;
-	}
-
-	chunk_num = ATOM_FETCH_ADD(*_next_chunk, 1); //-1);
-	if (chunk_num >= _num_chunks - 1) {
-    //if (chunk_num == (uint32_t)-1) {
-		//pthread_mutex_unlock(_mutex);
-		//FREE(chunk, _chunk_size);
-		return (uint32_t)-1;
-	}
-	uint64_t start_lsn = _starting_lsns[chunk_num];
-	uint64_t end_lsn = _starting_lsns[chunk_num + 1];
-	base_lsn = start_lsn;
-
-	uint64_t fstart = start_lsn / 512 * 512; 
-	uint64_t fend = end_lsn;
-	if (fend % 512 != 0)
-		fend = fend / 512 * 512 + 512; 
-	assert(fend - fstart < _chunk_size);
-
-	string path = _file_name + ".0";
-	int fd;
-	if(g_ramdisk)
-	{
-		fd = open(path.c_str(), O_RDONLY);
-	}
-	else{
-		//printf("Open with O_DIRECT\n");
-		fd = open(path.c_str(), O_DIRECT | O_RDONLY);
-	}
-	M_ASSERT(fd != -1, "bad fd, error in open, errno=%d\n", errno);
-	cb.aio_fildes = fd;
-	cb.aio_buf = other_chunk;
-	cb,aio_nbytes = fend - fstart;
-	cb.aio_offset = fstart;
-	lastTime = get_sys_clock();
-	lastLSN = start_lsn;
-	if(aio_read64(&cb) == -1)
-	{
-		assert(false);
-	}
-	AIOWorking = true;
-
-    INC_INT_STATS(time_recover2, get_sys_clock() - phase1);
-	return chunk_num;
-#else
-	assert(false);
-	return 0;
-#endif
-
-}
-#else
 uint32_t
 LogManager::get_next_log_chunk(char * &chunk, uint64_t &size, uint64_t &base_lsn)
 {
-#if LOG_ALGORITHM == LOG_PARALLEL || LOG_ALGORITHM == LOG_BATCH || (LOG_ALGORITHM == LOG_TAURUS && TAURUS_CHUNK)
+#if LOG_ALGORITHM == LOG_PARALLEL || LOG_ALGORITHM == LOG_BATCH
 	// allocate the next chunk number. 
 	// grab a lock on the log file
 	// read sequentially the next chunk.
 	// release the lock.
-	//chunk = (char*) MALLOC(_chunk_size, GET_THD_ID);
+	//chunk = new char [_chunk_size];
     uint64_t start = get_sys_clock();
+	chunk = (char*) _mm_malloc(_chunk_size, 512); // need to be aligned
+	//if (_logger_id == 3)
+	//	pthread_mutex_lock(_mutex);
 	
 	//INC_INT_STATS(time_debug6, get_sys_clock() - tt);
 	//uint64_t tt = get_sys_clock();
@@ -908,7 +863,7 @@ LogManager::get_next_log_chunk(char * &chunk, uint64_t &size, uint64_t &base_lsn
 	if (chunk_num >= _num_chunks - 1) {
     //if (chunk_num == (uint32_t)-1) {
 		//pthread_mutex_unlock(_mutex);
-		//FREE(chunk, _chunk_size);
+		_mm_free(chunk);
 		return (uint32_t)-1;
 	}
 	uint64_t start_lsn = _starting_lsns[chunk_num];
@@ -924,13 +879,9 @@ LogManager::get_next_log_chunk(char * &chunk, uint64_t &size, uint64_t &base_lsn
 	string path = _file_name + ".0";
 	int fd;
 	if(g_ramdisk)
-	{
 		fd = open(path.c_str(), O_RDONLY);
-	}
-	else{
-		//printf("Open with O_DIRECT\n");
+	else
 		fd = open(path.c_str(), O_DIRECT | O_RDONLY);
-	}
 	M_ASSERT(fd != -1, "bad fd, error in open, errno=%d\n", errno);
 	lseek(fd, fstart, SEEK_SET);
 	
@@ -961,11 +912,15 @@ LogManager::get_next_log_chunk(char * &chunk, uint64_t &size, uint64_t &base_lsn
 #endif
 
 }
-#endif
 	
 void
 LogManager::return_log_chunk(char * buffer, uint32_t chunk_num)
 {
+	uint64_t start_lsn = _starting_lsns[chunk_num];
+	//uint64_t end_lsn = _starting_lsns[chunk_num + 1];
+	char * chunk = buffer - start_lsn % 512;
+	//delete chunk;
+	_mm_free(chunk);
 }
 
 void 

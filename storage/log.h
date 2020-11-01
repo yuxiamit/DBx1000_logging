@@ -75,10 +75,6 @@ public:
 	uint64_t _log_buffer_size;
     uint64_t _fdatasize;
 
-#if LOG_ALGORITHM == LOG_PLOVER
-	uint64_t plover_ready_lsn;
-#endif
-
 	////////////////////////////	
 	// recovery 
 	////////////////////////////	
@@ -120,18 +116,26 @@ private:
 	///////////////////////////////////////////////////////	
 	// data structures shared by forward processing and recovery 
 	///////////////////////////////////////////////////////	
-public:
+private:
 #if LOG_ALGORITHM == LOG_BATCH
 public:
 //	uint64_t get_max_flushed_epoch() {
 //		return *_max_flushed_epoch;
 //	}
-public:
-
+private:
+//	enum BufferState {BUF_WAIT_FOR_FLUSH, BUF_FLUSHED};
+	// one buffer for each epoch.
+//	uint32_t 			_num_buffers;
+//	char ** 			_buffers;
+//	BufferState ** 		_buffer_state;
+	// the maximum epoch number seen by each worker thread.
+	// the logs for an epoch E can be flushed when E is smaller than all entries in _max_epochs 
+	//volatile uint64_t **			_max_epochs;
+//	uint64_t * 			_max_flushed_epoch; 
 #endif
 	// log_tail for each buffer.
 	//uint64_t ** 		_lsns;
-
+//#else 
 	char * 				_buffer;		// circular buffer to store unflushed data.
 	//uint32_t  			_curr_file_id;
 		
@@ -148,4 +152,6 @@ public:
 	//fstream * 			_file;
 	uint32_t 			_logger_id;
 
+	//pthread_mutex_t lock;
+//private:
 };

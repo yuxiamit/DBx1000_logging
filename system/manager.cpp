@@ -17,21 +17,21 @@ __thread drand48_data Manager::_buffer;
 unordered_map<uint64_t, pending_entry *> _log_pending_map;
 
 void Manager::init() {
-	timestamp = (uint64_t *) MALLOC(sizeof(uint64_t), GET_THD_ID);
+	timestamp = (uint64_t *) _mm_malloc(sizeof(uint64_t), ALIGN_SIZE);
 	*timestamp = 1;
 	_last_min_ts_time = 0;
 	_min_ts = 0;
-	_epoch = (volatile uint64_t *) MALLOC(sizeof(uint64_t), GET_THD_ID);
+	_epoch = (volatile uint64_t *) _mm_malloc(sizeof(uint64_t), ALIGN_SIZE);
 	_max_epochs = new volatile uint64_t * [g_thread_cnt];
-	_last_epoch_update_time = (ts_t *) MALLOC(sizeof(uint64_t), GET_THD_ID);
+	_last_epoch_update_time = (ts_t *) _mm_malloc(sizeof(uint64_t), ALIGN_SIZE);
 	// First epoch is epoch 1. 
 	*_epoch = 1;
 	COMPILER_BARRIER
 	*_last_epoch_update_time = get_sys_clock();
-	all_ts = (ts_t volatile **) MALLOC(sizeof(ts_t *) * g_thread_cnt, GET_THD_ID);
+	all_ts = (ts_t volatile **) _mm_malloc(sizeof(ts_t *) * g_thread_cnt, ALIGN_SIZE);
 	for (uint32_t i = 0; i < g_thread_cnt; i++) {
-		all_ts[i] = (ts_t *) MALLOC(sizeof(ts_t), GET_THD_ID);
-		_max_epochs[i] = (volatile uint64_t *) MALLOC(sizeof(uint64_t), GET_THD_ID);
+		all_ts[i] = (ts_t *) _mm_malloc(sizeof(ts_t), ALIGN_SIZE);
+		_max_epochs[i] = (volatile uint64_t *) _mm_malloc(sizeof(uint64_t), ALIGN_SIZE);
 		*_max_epochs[i] = 0;
 	}
 
@@ -47,10 +47,8 @@ void Manager::init() {
 	// unorderedmap<uint64_t, * pred_entry> _log_pending_map = {};
 	//_log_pending_table = new LogPendingTable;
 	_persistent_epoch = new volatile uint64_t * [g_num_logger];
-	for (uint32_t i = 0; i < g_num_logger; i++) {
-		_persistent_epoch[i] = (volatile uint64_t *) MALLOC(sizeof(uint64_t), GET_THD_ID);
-		*_persistent_epoch[i] = 0;  // initialize
-	}
+	for (uint32_t i = 0; i < g_num_logger; i++) 
+		_persistent_epoch[i] = (volatile uint64_t *) _mm_malloc(sizeof(uint64_t), ALIGN_SIZE);
 	_epoch_mapping = new uint64_t * [g_thread_cnt];
 	_active_epoch = new uint64_t [g_thread_cnt];
 	for (uint32_t i = 0; i < g_thread_cnt; i++) {
@@ -60,16 +58,6 @@ void Manager::init() {
 		_epoch_mapping[i] = new uint64_t [max_epoch];
 		memset(_epoch_mapping[i], -1, sizeof(uint64_t) * max_epoch);
 	}
-    /*
-	#if LOG_ALGORITHM == LOG_TAURUS && COMPRESS_LSN_LOG    
-	lastPSN = (uint64_t**) MALLOC(sizeof(uint64_t*) * g_num_logger, GET_THD_ID);
-	for(uint32_t i=0; i<g_num_logger; i++)
-	{
-		lastPSN[i] = (uint64_t*) MALLOC(sizeof(uint64_t), GET_THD_ID);
-		lastPSN[i][0] = 0;
-	}
-	#endif
-    */
 }
 
 uint64_t 
@@ -111,19 +99,6 @@ Manager::get_ts(uint64_t thread_id) {
 ts_t Manager::get_min_ts(uint64_t tid) {
 	assert (g_log_recover);
 	return _min_ts;
-/*	uint64_t now = get_sys_clock();
-	uint64_t last_time = _last_min_ts_time; 
-	if (tid == 0 && now - last_time > MIN_TS_INTVL)
-	{ 
-		ts_t min = UINT64_MAX;
-    	for (uint32_t i = 0; i < g_thread_cnt; i++) 
-	    	if (*all_ts[i] < min)
-    	    	min = *all_ts[i];
-		if (min > _min_ts)
-			_min_ts = min;
-	}
-	return _min_ts;
-*/
 }
 
 uint64_t 
@@ -208,19 +183,6 @@ Manager::rand_double()
 #endif
     return r;
 }
-
-
-// TODO. make this lock free.
-/*
-bool
-Manager::is_log_pending(uint64_t txn_id)
-{
-	pthread_mutex_lock( &_log_mutex );
-	bool is_pending = (_log_pending_map.find(txn_id) != _log_pending_map.end()) ;
-	pthread_mutex_unlock( &_log_mutex );
-	return is_pending;
-}*/
-
 
 void
 Manager::add_log_pending(uint64_t txn_id, uint64_t * predecessors, uint32_t predecessor_size)

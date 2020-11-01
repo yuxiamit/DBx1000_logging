@@ -13,7 +13,7 @@ Row_tictoc::init(row_t * row)
 #if ATOMIC_WORD
 	_ts_word = 0;
 #else
-	_latch = (pthread_mutex_t *) MALLOC(sizeof(pthread_mutex_t), GET_THD_ID);
+	_latch = (pthread_mutex_t *) _mm_malloc(sizeof(pthread_mutex_t), ALIGN_SIZE);
 	pthread_mutex_init( _latch, NULL );
 	_wts = 0;
 	_rts = 0;

@@ -2,13 +2,17 @@
 
 #include "global.h"
 #include "helper.h"
+#include <unordered_map>
 
 class workload;
 class thread_t;
 class row_t;
 class table_t;
 class base_query;
-class INDEX;
+//class INDEX;
+class HASH_INDEX;
+class ARRAY_INDEX;
+class ORDERED_INDEX;
 class PredecessorInfo; 	
 
 // each thread has a txn_man. 
@@ -16,6 +20,16 @@ class PredecessorInfo;
 
 //For VLL
 enum TxnType {VLL_Blocked, VLL_Free};
+
+class ScanHistory {
+public:
+	ORDERED_INDEX* idx;
+	bool rev;
+	uint64_t key;
+	uint64_t max_key;
+	uint64_t row_count; // assuming 2pl, we only need to record scan counts to prevent phantoms.
+	uint64_t part_id;
+};
 
 class Access {
 public:
@@ -95,9 +109,33 @@ public:
 
 	// For VLL
 	TxnType 		vll_txn_type;
-	itemid_t *		index_read(INDEX * index, idx_key_t key, int part_id);
-	void 			index_read(INDEX * index, idx_key_t key, int part_id, itemid_t *& item);
+
+	template <typename IndexT>
+	itemid_t *		index_read(IndexT * index, idx_key_t key, int part_id);
+
+	template <typename IndexT>
+	RC index_read(IndexT* index, idx_key_t key, row_t** row, int part_id);
+
+	template <typename IndexT>
+	void index_read(IndexT * index, idx_key_t key, int part_id, itemid_t *& item);
+	
+	template <typename IndexT>
+	RC index_read_multiple(IndexT* index, idx_key_t key, row_t** rows, size_t& count, int part_id);
+
+	template <typename IndexT>
+	row_t* search(IndexT* index, uint64_t key, int part_id,
+                        access_t type, bool skip_read=false);
+	
+	template <typename IndexT>
+	RC index_read_range(IndexT* index, idx_key_t min_key, idx_key_t max_key, row_t ** rows, size_t& count, int part_id);
+
+	template <typename IndexT>
+	RC index_read_range_rev(IndexT* index, idx_key_t min_key, idx_key_t max_key, row_t** rows, size_t& count, int part_id);
+
+	RC apply_index_changes(RC rc);
+
 	row_t * 		get_row(row_t * row, access_t type);
+	
 	RC				get_row(row_t * row, access_t type, char * &data);
 
 	// For LOGGING
@@ -111,13 +149,54 @@ public:
 
 protected:	
 	void 			insert_row(row_t * row, table_t * table);
-private:
+	bool insert_row(table_t* tbl, row_t*& row, int part_id, uint64_t& out_row_id);
+	bool remove_row(row_t* row);
+
+	template <typename IndexT>
+	bool insert_idx(IndexT* index, uint64_t key, row_t* row, int part_id, int index_id);
+
+	template <typename IndexT>
+	bool remove_idx(IndexT* index, uint64_t key, row_t* row, int part_id, int index_id);
+
+
+//private:
 	// insert rows
+	// insert/remove rows
 	uint64_t 		insert_cnt;
 	row_t * 		insert_rows[MAX_ROW_PER_TXN];
+	uint64_t 		remove_cnt;
+	row_t * 		remove_rows[MAX_ROW_PER_TXN];
+	uint64_t		scan_cnt;
+	ScanHistory *	scan_results;
+	
+	//uint32_t find_index_id(ORDERED_INDEX* idx);
+
+	// insert/remove indexes
+	uint64_t 		   insert_idx_cnt;
+	ORDERED_INDEX*   insert_idx_idx[MAX_ROW_PER_TXN];
+	uint32_t		insert_idx_id[MAX_ROW_PER_TXN];
+	idx_key_t	     insert_idx_key[MAX_ROW_PER_TXN];
+	row_t* 		     insert_idx_row[MAX_ROW_PER_TXN];
+	uint32_t		insert_idx_row_id[MAX_ROW_PER_TXN];
+	int	       	   insert_idx_part_id[MAX_ROW_PER_TXN];
+
+	uint64_t 		   remove_idx_cnt;
+	ORDERED_INDEX*   remove_idx_idx[MAX_ROW_PER_TXN];
+	int  		remove_idx_id[MAX_ROW_PER_TXN];
+	idx_key_t	     remove_idx_key[MAX_ROW_PER_TXN];
+	int	      	   remove_idx_part_id[MAX_ROW_PER_TXN];
+
+        // node set for phantom avoidance
+        std::unordered_map<void*, uint64_t>  node_map;
+        friend class IndexHash;
+        friend class IndexArray;
+        friend class IndexMBTree;
+        friend class IndexMBTree_cb;
+        friend class IndexMICAMBTree;
+        friend class IndexMICAMBTree_cb;
+
 	uint64_t 		txn_id;
 	ts_t 			timestamp;
-	
 
 #if CC_ALG == TICTOC || CC_ALG == SILO
 	bool 			_write_copy_ptr;
@@ -167,9 +246,7 @@ public:
 		}
 	};
 #elif LOG_ALGORITHM == LOG_TAURUS
-	uint32_t	thread_local_counter;
-	uint32_t  	target_logger_id;
-	uint64_t * 	partition_accesses_cnt;
+	uint32_t thread_local_counter;
 #elif LOG_ALGORITHM == LOG_SERIAL
 	void update_lsn(uint64_t lsn) {
 		if (lsn > _max_lsn)
@@ -179,20 +256,13 @@ public:
 protected:	
 	//virtual uint32_t get_cmd_log_size() { assert(false); }
 	virtual void 	get_cmd_log_entry() { assert(false); }
-	virtual void 	get_cmd_log_entry(char * log_entry, uint32_t & log_entry_size) { assert(false); }
-	virtual uint32_t 	get_cmd_log_entry_length() { assert(false); }
+	virtual uint32_t 	get_cmd_log_entry_length() { assert(false); return 0; }
 	virtual void 	recover_txn(char * log_entry, uint64_t tid = (uint64_t)-1)  
 	{ assert(false); }
 	//RecoverState * recover_state) { assert(false); }
-#if LOG_ALGORITHM == LOG_PLOVER
-	uint32_t *		_log_entry_sizes;
-	char **			_log_entries;
-
-	uint64_t *		_targets;
-#else
 	uint32_t 		_log_entry_size;
-	char * 			_log_entry;
-#endif
+	char * 			
+	_log_entry;
 public:
 	void 			try_commit_txn();	
 //private:
@@ -235,11 +305,8 @@ public:
 		uint64_t preds[NUM_LOGGER]; 
 	#elif LOG_ALGORITHM == LOG_BATCH
 		uint64_t epoch;
-	#elif LOG_ALGORITHM == LOG_PLOVER
-		uint64_t gsn;
-		uint64_t target_lsn;
 	#elif LOG_ALGORITHM == LOG_TAURUS
-		lsnType * lsn_vec;
+		uint64_t * lsn_vec;
 		//uint64_t max_lsn;
 		//uint32_t destination; // the target log file
 		// empty for now
@@ -248,7 +315,7 @@ public:
 		uint64_t wait_start_time;
 		/*TxnState(){
 			cout << "constructor called" << endl;
-			lsn_vec = (uint64_t*) MALLOC( sizeof(uint64_t) * g_num_logger, GET_THD_ID);
+			lsn_vec = (uint64_t*) _mm_malloc( sizeof(uint64_t) * g_num_logger, ALIGN_SIZE);
 		}
 		~TxnState(){
 			_mm_free(lsn_vec);
@@ -259,7 +326,7 @@ public:
 	queue<TxnState> * _txn_state_queue;
 	
 #if LOG_ALGORITHM == LOG_TAURUS
-	lsnType * queue_lsn_vec_buffer;
+	uint64_t * queue_lsn_vec_buffer;
 
 	uint64_t queue_lsn_vec_buffer_length;
 	uint64_t queue_lsn_vec_counter;
@@ -267,8 +334,6 @@ public:
 
 #if LOG_ALGORITHM == LOG_SERIAL
 	void 			serial_recover();
-#elif LOG_ALGORITHM == LOG_PLOVER
-	void			plover_recover();
 #elif LOG_ALGORITHM == LOG_PARALLEL
 	void 			parallel_recover();
 #elif LOG_ALGORITHM == LOG_BATCH

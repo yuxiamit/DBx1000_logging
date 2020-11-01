@@ -8,7 +8,7 @@ TABLE=WAREHOUSE
 	2,string,W_STATE
 	9,string,W_ZIP
 	8,double,W_TAX
-	8,double,W_YTD
+	8,double,W_YTD,1
 
 TABLE=DISTRICT
 	8,int64_t,D_ID
@@ -20,8 +20,8 @@ TABLE=DISTRICT
 	2,string,D_STATE
 	9,string,D_ZIP
 	8,double,D_TAX
-	8,double,D_YTD
-	8,int64_t,D_NEXT_O_ID
+	8,double,D_YTD,1
+	8,int64_t,D_NEXT_O_ID,2
 
 TABLE=CUSTOMER
 	8,int64_t,C_ID
@@ -38,14 +38,14 @@ TABLE=CUSTOMER
 	16,string,C_PHONE
 	8,int64_t,C_SINCE
 	2,string,C_CREDIT
-	8,int64_t,C_CREDIT_LIM
-	8,int64_t,C_DISCOUNT
-	8,double,C_BALANCE
-	8,double,C_YTD_PAYMENT
-	8,uint64_t,C_PAYMENT_CNT
-	8,uint64_t,C_DELIVERY_CNT
-	500,string,C_DATA
-	
+	8,double,C_CREDIT_LIM
+	8,double,C_DISCOUNT
+	8,double,C_BALANCE,1
+	8,double,C_YTD_PAYMENT,1
+	8,uint64_t,C_PAYMENT_CNT,1
+	8,uint64_t,C_DELIVERY_CNT,1
+	500,string,C_DATA,2
+
 TABLE=HISTORY
 	8,int64_t,H_C_ID
 	8,int64_t,H_C_D_ID
@@ -67,7 +67,7 @@ TABLE=ORDER
 	8,int64_t,O_D_ID
 	8,int64_t,O_W_ID
 	8,int64_t,O_ENTRY_D
-	8,int64_t,O_CARRIER_ID
+	8,int64_t,O_CARRIER_ID,1
 	8,int64_t,O_OL_CNT
 	8,int64_t,O_ALL_LOCAL
 
@@ -78,22 +78,22 @@ TABLE=ORDER-LINE
 	8,int64_t,OL_NUMBER
 	8,int64_t,OL_I_ID
 	8,int64_t,OL_SUPPLY_W_ID
-	8,int64_t,OL_DELIVERY_D
+	8,int64_t,OL_DELIVERY_D,1
 	8,int64_t,OL_QUANTITY
 	8,double,OL_AMOUNT
-	8,int64_t,OL_DIST_INFO
+	24,string,OL_DIST_INFO
 
 TABLE=ITEM
 	8,int64_t,I_ID
 	8,int64_t,I_IM_ID
 	24,string,I_NAME
-	8,int64_t,I_PRICE
+	8,double,I_PRICE
 	50,string,I_DATA
 
 TABLE=STOCK
 	8,int64_t,S_I_ID
 	8,int64_t,S_W_ID
-	8,int64_t,S_QUANTITY
+	8,int64_t,S_QUANTITY,1
 	24,string,S_DIST_01
 	24,string,S_DIST_02
 	24,string,S_DIST_03
@@ -104,26 +104,49 @@ TABLE=STOCK
 	24,string,S_DIST_08
 	24,string,S_DIST_09
 	24,string,S_DIST_10
-	8,int64_t,S_YTD
-	8,int64_t,S_ORDER_CNT
-	8,int64_t,S_REMOTE_CNT
+	8,int64_t,S_YTD,1
+	8,int64_t,S_ORDER_CNT,1
+	8,int64_t,S_REMOTE_CNT,1
 	50,string,S_DATA
 
-INDEX=ITEM_IDX
+// = g_max_items
+INDEX=HASH_ITEM_IDX
 ITEM,100000
 
-# the following sizes are linear to #warehouses
-INDEX=WAREHOUSE_IDX
+// The below is scaled by g_num_wh
+
+// = 1
+INDEX=HASH_WAREHOUSE_IDX
 WAREHOUSE,1
 
-INDEX=DISTRICT_IDX
+// = DIST_PER_WARE
+INDEX=HASH_DISTRICT_IDX
 DISTRICT,10
 
-INDEX=CUSTOMER_ID_IDX
+// = DIST_PER_WARE * g_cust_per_dist
+INDEX=HASH_CUSTOMER_ID_IDX
 CUSTOMER,30000
 
-INDEX=CUSTOMER_LAST_IDX
+// = DIST_PER_WARE * g_cust_per_dist
+INDEX=HASH_CUSTOMER_LAST_IDX
 CUSTOMER,30000
 
-INDEX=STOCK_IDX
+// = g_max_items
+INDEX=HASH_STOCK_IDX
 STOCK,100000
+
+// = DIST_PER_WARE * g_cust_per_dist
+INDEX=ORDERED_ORDER_IDX
+ORDER,30000
+
+// = DIST_PER_WARE * g_cust_per_dist
+INDEX=ORDERED_ORDER_CUST_IDX
+ORDER,30000
+
+// = DIST_PER_WARE * (g_cust_per_dist - 2100)
+INDEX=ORDERED_NEWORDER_IDX
+NEW-ORDER,9000
+
+// = DIST_PER_WARE * g_cust_per_dist * 10
+INDEX=ORDERED_ORDERLINE_IDX
+ORDER-LINE,300000

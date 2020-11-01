@@ -27,7 +27,7 @@ public:
 	// conversion is done within the function.
 	RC 			run();
 	~thread_t(){
-		FREE(_abort_buffer, sizeof(AbortBufferEntry) * _abort_buffer_size);
+		_mm_free(_abort_buffer);
 	}
 private:
 	uint64_t 	_host_cid;

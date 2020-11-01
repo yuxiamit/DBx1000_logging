@@ -29,8 +29,8 @@ PredecessorInfo::PredecessorInfo()
 	// For lower isolation levels. 
 	_raw_size = 0;
 	_waw_size = 0;
-	_preds_raw = (uint64_t *) MALLOC(sizeof(uint64_t) * MAX_ROW_PER_TXN, GET_THD_ID);
-	_preds_waw = (uint64_t *) MALLOC(sizeof(uint64_t) * MAX_ROW_PER_TXN, GET_THD_ID);
+	_preds_raw = (uint64_t *) _mm_malloc(sizeof(uint64_t) * MAX_ROW_PER_TXN, ALIGN_SIZE);
+	_preds_waw = (uint64_t *) _mm_malloc(sizeof(uint64_t) * MAX_ROW_PER_TXN, ALIGN_SIZE);
 }
 
 void 
@@ -108,7 +108,7 @@ ParallelLogManager::ParallelLogManager()
 {
 	num_txns_recovered = new uint64_t volatile * [g_thread_cnt];
 	for (uint32_t i = 0; i < g_thread_cnt; i++) {
-		num_txns_recovered[i] = (uint64_t *) MALLOC(sizeof(uint64_t), GET_THD_ID);
+		num_txns_recovered[i] = (uint64_t *) _mm_malloc(sizeof(uint64_t), ALIGN_SIZE);
 		*num_txns_recovered[i] = 0;
 	}
 

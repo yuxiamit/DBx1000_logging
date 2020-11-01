@@ -106,10 +106,7 @@ void print_val() {
 	printf("\t-LpINT      ; LOG_PARALLEL_REC_NUM_POOLS %d\n", g_num_pools);
 	printf("\t-LzINT      ; POOLSIZE_WAIT %d\n", g_poolsize_wait);
 	printf("\t-LwINT      ; SCAN_WINDOW %d\n", g_scan_window);
-	printf("\t-LBINT      ; g_flush_blocksize %lu\n", g_flush_blocksize);
-	printf("\t-LKINT	  ; g_read_blocksize %lu", g_read_blocksize);
-	printf("\t-LDINT      ; g_num_disk %d\n", g_num_disk);
-
+		
 	printf("  [YCSB]:\n");
 	printf("\t-cINT       ; PART_PER_TXN %d\n", g_part_per_txn);
 	printf("\t-eINT       ; PERC_MULTI_PART %lf\n", g_perc_multi_part);
@@ -223,10 +220,7 @@ void parser(int argc, char * argv[]) {
 		// Logging
 		else if (argv[i][1] == 'L'){
 			if (argv[i][2] == 'b')
-			{
 				g_log_buffer_size = strtoull( &argv[i][3], NULL, 10);
-				//g_read_blocksize = (uint64_t)(g_log_buffer_size * g_recover_buffer_perc);
-			}
 			else if(argv[i][2] == 'e') {
 				g_max_num_epoch = atoi(&argv[i][3]);
 			}
@@ -254,13 +248,6 @@ void parser(int argc, char * argv[]) {
 				g_num_logger = atoi( &argv[i][3] );
 			else if (argv[i][2] == 'D')
 				g_num_disk = atoi( &argv[i][3] );
-			else if (argv[i][2] == 'B')
-				g_flush_blocksize = atoi(&argv[i][3]);
-			else if (argv[i][2] == 'K')
-			{
-				// recommend putting -LK at the end.
-				g_read_blocksize = atoi(&argv[i][3]);
-			}
 			else if (argv[i][2] == 'f') { 
 				char c = argv[i][3];
 				assert(c == '0' || c == '1');
@@ -278,12 +265,7 @@ void parser(int argc, char * argv[]) {
 			else if (argv[i][2] == 't')
 				g_flush_interval = atoi( &argv[i][3] ); 
 			else if (argv[i][2] == 's')
-			{
-				printf("Warning: -Ls (g_recover_buffer_perc) is deprecated.\n");
-				assert(false);
 				g_recover_buffer_perc = atof( &argv[i][3] ); 
-				//g_read_blocksize = (uint64_t)(g_log_buffer_size * g_recover_buffer_perc);
-			}
 			else if (argv[i][2] == 'z')
 				g_poolsize_wait = atof( &argv[i][3] ); 
 			else if (argv[i][2] == 'w')
@@ -316,28 +298,17 @@ void parser(int argc, char * argv[]) {
 		else
 			assert(false);
 	}
-
 	if (g_num_disk == 0) g_num_disk = g_num_logger;
 	cout << "Using " << g_num_disk << " disks." << endl;
-	/*
 	if (g_ramdisk && g_num_disk > 1)
 	{
 		cout << "Using RAMDISK, changing g_num_disk to 1" << endl;
 		g_num_disk = 1; // only write to /data0
 	}
-	*/
 	// Auto 
 
 	unsigned concurentThreadsSupported = std::thread::hardware_concurrency();
 	if(concurentThreadsSupported !=0) g_init_parallelism = concurentThreadsSupported; // use as many threads as possible
-
-	printf("g_flush_blocksize=%lu, g_log_buffer_size=%lu\n", g_flush_blocksize, g_log_buffer_size);
-	//assert(g_flush_blocksize < g_log_buffer_size / 2);
-	if(g_flush_blocksize >= g_log_buffer_size / 2) g_log_buffer_size = g_flush_blocksize * 4;
-	if(g_log_recover && g_read_blocksize >= g_log_buffer_size / 2)
-		g_log_buffer_size = g_read_blocksize * 4;
-		//assert(g_read_blocksize < g_log_buffer_size / 2);
-	assert(g_log_buffer_size % 512 == 0);
 
 	//if (g_thread_cnt < g_init_parallelism)
 	//	g_init_parallelism = g_thread_cnt;

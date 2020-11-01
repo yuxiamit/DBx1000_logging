@@ -9,6 +9,7 @@
 #define VERBOSE_SQL_CONTENT         8
 /***********************************************/
 
+
 /***********************************************/
 // Simulation + Hardware
 /***********************************************/
@@ -19,19 +20,15 @@
 #define PAGE_SIZE					4096 
 #define CL_SIZE						64
 // CPU_FREQ is used to get accurate timing info 
-#define CPU_FREQ 3.7
+#define CPU_FREQ 					2.3 	// in GHz/s // TODO: change this
 
 // # of transactions to run for warmup
 #define WARMUP						0
 // YCSB or TPCC
-#define WORKLOAD YCSB
+#define WORKLOAD TPCC
 // print the transaction latency distribution
 #define PRT_LAT_DISTR				false
 #define STATS_ENABLE				true
-// 0 for only analysis related
-// 1 for debug
-// 2 for verbose
-#define STAT_VERBOSE				1
 #define COLLECT_LATENCY				false
 #define TIME_ENABLE					true 
 
@@ -47,6 +44,10 @@
 #define MEM_SIZE					(1UL << 30) 
 #define NO_FREE						false
 
+// [RCU_ALLOC]
+#define RCU_ALLOC 					false
+#define RCU_ALLOC_SIZE     (20 * 1073741824UL)	// 20 GB
+
 /***********************************************/
 // Concurrency Control
 /***********************************************/
@@ -55,9 +56,9 @@
 #define CC_ALG NO_WAIT
 #define ISOLATION_LEVEL 			SERIALIZABLE
 
-#define USE_LOCKTABLE true
-#define LOCKTABLE_MODIFIER			(10003) // (256)
-#define LOCKTABLE_INIT_SLOTS		(0)
+#define USE_LOCKTABLE				true
+#define LOCKTABLE_MODIFIER (10003)
+#define LOCKTABLE_INIT_SLOTS (1)
 // all transactions acquire tuples according to the primary key order.
 #define KEY_ORDER					false
 // transaction roll back changes after abort
@@ -119,7 +120,7 @@
 // Logging
 /***********************************************/
 
-#define LOG_ALGORITHM LOG_BATCH
+#define LOG_ALGORITHM LOG_SERIAL
 #define LOG_TYPE LOG_DATA
 #define LOG_RAM_DISK				false
 #define LOG_NO_FLUSH			 	false
@@ -131,7 +132,7 @@
 #define LOG_PARALLEL_BUFFER_FILL	false 
 #define NUM_LOGGER					1 // the number of loggers
 #define LOG_PARALLEL_NUM_BUCKETS    4000000	// should equal the number of recovered txns
-#define MAX_LOG_ENTRY_SIZE			16384 // in Bytes
+#define MAX_LOG_ENTRY_SIZE			30000 // in Bytes
 #define LOG_FLUSH_INTERVAL 0
 #define TRACK_WAR_DEPENDENCY		true // necessary only for logical or command logging.  
 #define LOG_PARALLEL_REC_NUM_POOLS  THREAD_CNT 
@@ -148,7 +149,7 @@
 #define MAX_TUPLE_SIZE				1024 // in bytes
 // ==== [YCSB] ====
 #define INIT_PARALLELISM			32 // 28
-#define SYNTH_TABLE_SIZE (1024 * 1024 * 500)
+#define SYNTH_TABLE_SIZE 			(1024 * 1024 * 10)
 #define ZIPF_THETA 					0.6 // .6
 #define READ_PERC 					0.5
 #define WRITE_PERC 					0.5
@@ -163,7 +164,7 @@
 // small tpcc schemas shrink the table size.
 #define TPCC_SMALL					false // false // true // false
 // Some of the transactions read the data but never use them. 
-// If TPCC_ACCESS_ALL == fales, then these parts of the transactions
+// If TPCC_ACCESS_ALL == false, then these parts of the transactions
 // are not modeled.
 #define TPCC_ACCESS_ALL 			false 
 #define WH_UPDATE					true
@@ -261,7 +262,6 @@ extern TestCases					g_test_case;
 #define LOG_BATCH                   3
 #define LOG_PARALLEL                4
 #define LOG_TAURUS					5
-#define LOG_PLOVER					6
 // Logging type
 #define LOG_DATA					1
 #define LOG_COMMAND					2
@@ -271,24 +271,20 @@ extern TestCases					g_test_case;
 #define EVICT_FREQ					10000
 #define WITHOLD_LOG					false 
 #define COMPRESS_LSN_LT				false
-#define COMPRESS_LSN_LOG			false // false
+#define COMPRESS_LSN_LOG			true // false
 #define PSN_FLUSH_FREQ				1000
 #define LOCKTABLE_EVICT_BUFFER		30000
 #define SOLVE_LIVELOCK				true
 #define POOLSIZE_WAIT				2000 // if pool size is too small it might cause live lock.
-#define PER_WORKER_RECOVERY 		(false)
+#define PER_WORKER_RECOVERY (false)
 #define RECOVER_BUFFER_PERC			(0.5)
 #define TAURUS_RECOVER_BATCH_SIZE	(500)
 #define ASYNC_IO					true
 #define DECODE_AT_WORKER			false
-#define UPDATE_SIMD (true)
+#define UPDATE_SIMD					false
 #define SCAN_WINDOW 2
 #define BIG_HASH_TABLE_MODE (true)
 #define PROCESS_DEPENDENCY_LOGGER (false)
-#define PARTITION_AWARE				false // this switch does not bring much benefit for YCSB
-#define TAURUS_CHUNK				false
-#define TAURUS_CHUNK_MEMCPY			true
-#define DISTINGUISH_COMMAND_LOGGING	true
 // big hash table mode means locktable evict buffer is infinite.
 /************************************/
 // LOG BATCH
@@ -302,60 +298,27 @@ extern TestCases					g_test_case;
 
 #define RECOVER_TAURUS_LOCKFREE		false  // Use the SPMC-Pool for each logger
 #define POOL_SE_SPACE (8)
+#define TPCC_FULL true
+#define TPCC_DBX1000_SERIAL_DELIVERY false
+#define TPCC_INSERT_INDEX true
+#define TPCC_INSERT_ROWS true
+#define TPCC_DELETE_ROWS true
+#define TPCC_DELETE_INDEX true
 
-#define FLUSH_BLOCK_SIZE		1048576 // twice as best among 4096 40960 409600 4096000
-#define READ_BLOCK_SIZE 419430400
+#define TPCC_SPLIT_DELIVERY false
+#define TPCC_VALIDATE_GAP false
+#define TPCC_VALIDATE_NODE false
+#define SIMPLE_INDEX_UPDATE false
+#define MAX_SCAN_PER_TXN 30
+
+#define TPCC_PHANTOM_AVOIDANCE false
+
+#define PHANTOM_SILO 0
+#define PHANTOM_LOCK 1
+#define TPCC_PHANTOM_AVOIDANCE_ALG PHANTOM_SILO
 
 #define AFFINITY true // true
 
-/************************************/
-// LOG PLOVER
-/************************************/
-
-#define PLOVER_NO_WAIT				true
-
-
-/************************************/
-// SIMD Config
-/************************************/
-
-#define MAX_LOGGER_NUM_SIMD 16
-#define SIMD_PREFIX __m512i // __m256i
-#define MM_MAX _mm512_max_epu32 //_mm256_max_epu32
-#define MM_MASK __mmask16
-#define MM_CMP _mm512_cmp_epu32_mask
-#define MM_EXP_LOAD _mm512_maskz_expandloadu_epi32
-#define MM_INTERLEAVE_MASK 0x5555
-#if UPDATE_SIMD
-#define G_NUM_LOGGER MAX_LOGGER_NUM_SIMD
-#else
-#define G_NUM_LOGGER g_num_logger
-#endif
-
-#define NUM_CORES_PER_SLOT	(24)
-#define NUMA_NODE_NUM	(2)
-#define HYPER_THREADING_FACTOR (2) // in total 24 * 2 * 2 = 96
-
-/************************************/
-#define OUTPUT_AVG_RATIO 0.5
-
 #include "config-assertions.h"
-
-#define MM_MALLOC(x,y) _mm_malloc(x, ALIGN_SIZE)
-#define MM_FREE(x,y) _mm_free(x)
-#include "numa.h"
-#define NUMA_MALLOC(x,y) numa_alloc_onnode(x, ((y) % g_num_logger) % NUMA_NODE_NUM)
-#define NUMA_FREE(x,y) numa_free(x, y)
-
-#if WORKLOAD == YCSB && CC_ALG == SILO
-#define MALLOC NUMA_MALLOC
-#define FREE NUMA_FREE
-#else
-#define MALLOC MM_MALLOC
-#define FREE MM_FREE
-#endif
-
-///////// MISC
-#define WORK_IN_PROGRESS true
 
 #endif

@@ -55,17 +55,29 @@ def insert_his(alg, workload='YCSB', cc_alg='NO_WAIT', log_type='LOG_DATA', reco
         jobs[name]["WITHOLD_LOG"] = 'true'
     else:
         jobs[name] = {}
+
+    
+    jobs[name]['TPCC_FULL'] = 'true'
+    jobs[name]['TPCC_DBX1000_SERIAL_DELIVERY'] = 'false'
+    jobs[name]['TPCC_INSERT_INDEX'] = 'true'
+    jobs[name]['TPCC_INSERT_ROWS'] = 'true'
+    jobs[name]['TPCC_DELETE_ROWS'] = 'true'
+    jobs[name]['TPCC_DELETE_INDEX'] = 'true'
+
+    jobs[name]['TPCC_SPLIT_DELIVERY'] = 'false'
+    jobs[name]['TPCC_VALIDATE_GAP'] = 'false'
+    jobs[name]['TPCC_VALIDATE_NODE'] = 'false'
+    jobs[name]['SIMPLE_INDEX_UPDATE'] = 'false'
+    jobs[name]['MAX_SCAN_PER_TXN'] = '30'
     
     jobs[name]["LOG_ALGORITHM"] = "LOG_%s" % alg.upper()
-    jobs[name]["WORKLOAD"] = workload
+    jobs[name]["WORKLOAD"] = workload.replace('TPCF', 'TPCC')
     jobs[name]["LOG_TYPE"] = log_type
     jobs[name]["CC_ALG"] = cc_alg
     jobs[name]["MAX_TXNS_PER_THREAD"] = '(150000)'
     jobs[name]['BIG_HASH_TABLE_MODE'] = '(true)'
     jobs[name]['PROCESS_DEPENDENCY_LOGGER'] = '(false)'
-    if workload == 'YCSB':
-        jobs[name]['SYNTH_TABLE_SIZE'] = '(1024 * 1024 * 500)'
-    # jobs[name]['BIG_HASH_TABLE_MODE'] = '(true)'
+    jobs[name]["MAX_LOG_ENTRY_SIZE"] = '32768'
     if alg == 'no':
         # jobs[name]["USE_LOCKTABLE"] = 'false'
         jobs[name]["USE_LOCKTABLE"] = 'true'
@@ -77,33 +89,16 @@ def insert_his(alg, workload='YCSB', cc_alg='NO_WAIT', log_type='LOG_DATA', reco
         # jobs[name]['RECOVERY_FULL_THR'] = 'true' # better measurement
     if alg == 'serial':
         jobs[name]["COMPRESS_LSN_LOG"] = 'false'
-        if cc_alg == 'SILO':
-            jobs[name]["USE_LOCKTABLE"] = 'false'
-        elif cc_alg == 'NO_WAIT':
-            jobs[name]["USE_LOCKTABLE"] = 'true'
-            jobs[name]["LOG_BUFFER_SIZE"] = '26214400'
-            jobs[name]["MAX_LOG_ENTRY_SIZE"] = '8192'
+        jobs[name]["USE_LOCKTABLE"] = 'true'
+        jobs[name]["LOG_BUFFER_SIZE"] = '26214400'
+
+        
     if alg == 'taurus':
         jobs[name]['LOCKTABLE_INIT_SLOTS'] = '(1)'
         # jobs[name]['BIG_HASH_TABLE_MODE'] = '(false)'
-        if workload == 'YCSB':
-            if cc_alg == 'NO_WAIT':
-                jobs[name]["LOG_FLUSH_INTERVAL"] = '10000000'
-            jobs[name]["LOCKTABLE_MODIFIER"] = '(10003)'
-            jobs[name]["LOCKTABLE_INIT_SLOTS"] = '(1)'
-            jobs[name]["LOG_BUFFER_SIZE"] = '52428800'
-            jobs[name]["RECOVER_BUFFER_PERC"] = '(1.0)'
-            jobs[name]["POOLSIZE_WAIT"] = '2000'
-            jobs[name]["SOLVE_LIVELOCK"] = 'true'
-        elif workload == 'TPCC':
+        if True:
             # jobs[name]['ASYNC_IO'] = 'false' # try
             jobs[name]["LOCKTABLE_MODIFIER"] = '(10003)'
-            if cc_alg == 'SILO':
-                jobs[name]["LOG_BUFFER_SIZE"] = '524288000'
-                jobs[name]["LOCKTABLE_INIT_SLOTS"] = '(0)'
-                jobs[name]["SOLVE_LIVELOCK"] = 'true'
-                jobs[name]["RECOVER_BUFFER_PERC"] = '(0.5)'
-                jobs[name]["LOG_FLUSH_INTERVAL"] = '600000000'
             if log_type == 'LOG_DATA':
                 jobs[name]['PROCESS_DEPENDENCY_LOGGER'] = '(false)'
     jobs[name]["LOG_FLUSH_INTERVAL"] = '0' # we do not want the flushing time to disturb the result.
@@ -133,25 +128,21 @@ jobs = {}
 if len(sys.argv) > 1:
     insert_his(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4])
 else:
-    benchmarks = ['YCSB', 'TPCC']
+    benchmarks = ['TPCF']
     for bench in benchmarks:
         #insert_his('parallel', bench, 'LOG_DATA')
         #insert_his('parallel', bench, 'LOG_COMMAND')
         #insert_his('batch', bench, 'LOG_DATA')
         
         insert_his('no', bench, 'NO_WAIT', 'LOG_DATA')
-        insert_his('no', bench, 'SILO', 'LOG_DATA')
-        insert_his('serial', bench, 'SILO', 'LOG_DATA')
-        insert_his('serial', bench, 'SILO', 'LOG_COMMAND')
         insert_his('serial', bench, 'NO_WAIT', 'LOG_DATA')
         insert_his('serial', bench, 'NO_WAIT', 'LOG_COMMAND')
-        insert_his('taurus', bench, 'SILO', 'LOG_DATA')
-        insert_his('taurus', bench, 'NO_WAIT', 'LOG_DATA')
-        insert_his('taurus', bench, 'NO_WAIT', 'LOG_COMMAND')
-        insert_his('taurus', bench, 'SILO', 'LOG_COMMAND')
-        insert_his('batch', bench, 'SILO', 'LOG_DATA')
-
         insert_his('serial', bench, 'NO_WAIT', 'LOG_COMMAND', withold_log='true')
+        
+        insert_his('taurus', bench, 'NO_WAIT', 'LOG_COMMAND')
+        insert_his('taurus', bench, 'NO_WAIT', 'LOG_DATA')
+
+        
 
 for (jobname, v) in jobs.items():
     os.system("cp " + dbms_cfg[0] + ' ' + dbms_cfg[1])

@@ -1,6 +1,7 @@
 #include "tpcc_helper.h"
 #include "manager.h"
 
+drand48_data** tpcc_buffer;
 uint64_t C_255, C_1023, C_8191;
 
 uint64_t distKey(uint64_t d_id, uint64_t d_w_id)  {
@@ -11,13 +12,41 @@ uint64_t custKey(uint64_t c_id, uint64_t c_d_id, uint64_t c_w_id) {
 	return (distKey(c_d_id, c_w_id) * g_cust_per_dist + c_id);
 }
 
+uint64_t orderlineKey(uint64_t ol_number, int64_t ol_o_id, uint64_t ol_d_id,
+                      uint64_t ol_w_id) {
+  // Use negative ol_o_id to allow reusing the current index interface.
+  return distKey(ol_d_id, ol_w_id) * g_max_orderline * 15 +
+         (g_max_orderline - ol_o_id) * 15 + ol_number;
+}
+
+uint64_t neworderKey(int64_t o_id, uint64_t o_d_id, uint64_t o_w_id) {
+  return distKey(o_d_id, o_w_id) * g_max_orderline + (g_max_orderline - o_id);
+}
+
+/*
 uint64_t orderlineKey(uint64_t w_id, uint64_t d_id, uint64_t o_id) {
 	return distKey(d_id, w_id) * g_cust_per_dist + o_id; 
 }
-
+*/
+/*
 uint64_t orderPrimaryKey(uint64_t w_id, uint64_t d_id, uint64_t o_id) {
 	return orderlineKey(w_id, d_id, o_id); 
 }
+*/
+
+uint64_t orderKey(int64_t o_id, uint64_t o_d_id, uint64_t o_w_id) {
+  // Use negative o_id to allow reusing the current index interface.
+  return distKey(o_d_id, o_w_id) * g_max_orderline + (g_max_orderline - o_id);
+}
+
+uint64_t orderCustKey(int64_t o_id, uint64_t o_c_id, uint64_t o_d_id,
+                      uint64_t o_w_id) {
+  // Use negative o_id to allow reusing the current index interface.
+  return distKey(o_d_id, o_w_id) * g_cust_per_dist * g_max_orderline +
+         o_c_id * g_max_orderline + (g_max_orderline - o_id);
+}
+
+
 
 uint64_t custNPKey(char * c_last, uint64_t c_d_id, uint64_t c_w_id) {
 	uint64_t key = 0;
@@ -132,11 +161,11 @@ TableName table_str2num(string name)
 		return CUSTOMER;
 	else if (name == "HISTORY")
 		return HISTORY;
-	else if (name == "NEWORDER")
+	else if (name == "NEW-ORDER")
 		return NEWORDER;
 	else if (name == "ORDER")
 		return ORDER;
-	else if (name == "ORDERLINE")
+	else if (name == "ORDER-LINE")
 		return ORDERLINE;
 	else if (name == "ITEM")
 		return ITEM;
@@ -159,11 +188,11 @@ string table_num2str(TableName num)
 	else if (num == HISTORY)
 		return "HISTORY";
 	else if (num == NEWORDER)
-		return "NEWORDER";
+		return "NEW-ORDER";
 	else if (num == ORDER)
 		return "ORDER";
 	else if (num == ORDERLINE)
-		return "ORDERLINE";
+		return "ORDER-LINE";
 	else if (num == ITEM)
 		return "ITEM";
 	else if (num == STOCK)

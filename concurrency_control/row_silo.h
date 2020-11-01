@@ -19,13 +19,13 @@ public:
 	void				write(char * data, uint64_t tid);
 
 #if LOG_ALGORITHM == LOG_SERIAL
-	void 				lock(txn_man * txn, bool shared=false);
-	void 				release(txn_man * txn, RC rc_in, bool shared=false);
-	bool				try_lock(txn_man * txn, bool shared=false);
+	void 				lock(bool shared=false);
+	void 				release(bool shared=false);
+	bool				try_lock(bool shared=false);
 #else
-	void 				lock(txn_man * txn);
-	void 				release(txn_man * txn, RC rc_in);
-	bool				try_lock(txn_man * txn);
+	void 				lock();
+	void 				release();
+	bool				try_lock();
 #endif
 	uint64_t 			get_tid();
 	void 	 			set_tid(uint64_t tid) { _tid_word = tid; }

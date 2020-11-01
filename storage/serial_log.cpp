@@ -22,7 +22,7 @@ SerialLogManager::SerialLogManager()
 {
 	num_txns_recovered = new uint64_t volatile * [g_thread_cnt];
 	for (uint32_t i = 0; i < g_thread_cnt; i++) {
-		num_txns_recovered[i] = (uint64_t *) MALLOC(sizeof(uint64_t), GET_THD_ID);
+		num_txns_recovered[i] = (uint64_t *) _mm_malloc(sizeof(uint64_t), ALIGN_SIZE);
 		*num_txns_recovered[i] = 0;
 	}
 } 
@@ -38,8 +38,8 @@ SerialLogManager::~SerialLogManager()
 
 void SerialLogManager::init()
 {
-	lastLoggedTID = (volatile uint64_t *) MALLOC(sizeof(uint64_t), GET_THD_ID);
-	logLatch =  (volatile uint64_t *) MALLOC(sizeof(uint64_t), GET_THD_ID);
+	lastLoggedTID = (volatile uint64_t *) _mm_malloc(sizeof(uint64_t), 64);
+	logLatch =  (volatile uint64_t *) _mm_malloc(sizeof(uint64_t), 64);
         *lastLoggedTID = 0;
         *logLatch = 0;
 	_logger = new LogManager * [g_num_logger];
@@ -49,7 +49,7 @@ void SerialLogManager::init()
 	for(uint32_t i = 0; i < g_num_logger; i++) { 
 		// XXX
 		//MALLOC_CONSTRUCTOR(LogManager, _logger[i]);
-		_logger[i] = (LogManager*) MALLOC(sizeof(LogManager), GET_THD_ID); //new LogManager(i, GET_THD_ID);
+		_logger[i] = (LogManager*) _mm_malloc(sizeof(LogManager), 64); //new LogManager(i);
 		new (_logger[i]) LogManager(i);
 		string bench = "YCSB";
 		if (WORKLOAD == TPCC)
@@ -96,26 +96,32 @@ SerialLogManager::serialLogTxn(char * log_entry, uint32_t entry_size, lsnType ti
 {
 #if CC_ALG == SILO
 	assert(tid!=UINT64_MAX);
-	
+	//cout << tid << ", " << lastLoggedTID << endl;
 #endif
-	
+
+	// Format
+	// total_size | log_entry (format seen in txn_man::create_log_entry)
+	//uint32_t total_size = sizeof(uint32_t) + entry_size; // + sizeof(uint64_t);
+	//char new_log_entry[total_size];
+	//assert(total_size > 0);	
 	assert(entry_size == *((uint32_t *)log_entry + 1));
-	
+	//assert(entry_size > 300);
 	INC_INT_STATS(log_data, entry_size);
 	
 	uint64_t newlsn;
-	
+	//do {
 #if CC_ALG == SILO
-	
+	//newlsn = _logger[0]->logTxn(log_entry, entry_size, 0, false);
+	//newlsn = _logger[0]->logTxn(log_entry, entry_size, 0, true);
 	for(;;)
 	{
 		newlsn = _logger[0]->logTxn(log_entry, entry_size, 0, true); // need to sync
 		if(newlsn < UINT64_MAX)
 			break;
-		
-		PAUSE 
+		//assert(false);
+		PAUSE // usleep(10);
 	}
-	
+	//logLatch = 0;
 #else
 	for(;;)
 	{
@@ -126,8 +132,9 @@ SerialLogManager::serialLogTxn(char * log_entry, uint32_t entry_size, lsnType ti
 		#endif
 		if(newlsn < UINT64_MAX)
 			break;
-		
+		//assert(false);
 		PAUSE
+		//usleep(100);
 	}
 
 #endif

@@ -15,14 +15,13 @@
 #include "tpcc_query.h"
 #include "mem_alloc.h"
 #include "inttypes.h"
-#include "numa.h"
 
 void thread_t::init(uint64_t thd_id, workload * workload) {
 	_thd_id = thd_id;
 	_wl = workload;
 	//srand48_r((_thd_id + 1) * get_sys_clock(), &buffer);
 	_abort_buffer_size = ABORT_BUFFER_SIZE;
-	_abort_buffer = (AbortBufferEntry *) MALLOC(sizeof(AbortBufferEntry) * _abort_buffer_size, GET_THD_ID); 
+	_abort_buffer = (AbortBufferEntry *) _mm_malloc(sizeof(AbortBufferEntry) * _abort_buffer_size, ALIGN_SIZE); 
 	for (int i = 0; i < _abort_buffer_size; i++)
 		_abort_buffer[i].query = NULL;
 	_abort_buffer_empty_slots = _abort_buffer_size;
@@ -49,41 +48,18 @@ RC thread_t::run() {
 
 	//set_affinity(get_thd_id()); // TODO: to make this work
 #if AFFINITY
-	if(g_num_logger == 1)
+	uint32_t coreId = _thd_id % g_num_logger;
+	uint32_t workerId = _thd_id / g_num_logger;
+	#if LOG_ALGORITHM != LOG_SERIAL // LOG_ALGORITHM == LOG_TAURUS || LOG_ALGORITHM == LOG_BATCH
+	if(workerId + 1 >= NUM_CORES_PER_SLOT)
 	{
-		set_affinity(_thd_id + 1);
-		//printf("Setting thread %lu (Worker %u of Logger %u) to CPU node %lu\n", GET_THD_ID, workerId, coreId, projected_id % NUM_CORES_PER_SLOT + node_id * NUM_CORES_PER_SLOT + hyperfactor_scale * NUM_CORES_PER_SLOT * NUMA_NODE_NUM);
+		// hyperthreading
+		workerId += NUM_CORES_PER_SLOT * 3;
 	}
-	else
-	{	
-		assert(g_num_logger % NUMA_NODE_NUM == 0); // divide equally
-		uint32_t coreId = _thd_id % g_num_logger;
-		uint32_t workerId = _thd_id / g_num_logger;
-		uint64_t logger_per_node = g_num_logger / NUMA_NODE_NUM;
-		uint64_t node_id = coreId % NUMA_NODE_NUM;
-
-		uint64_t in_node_id = coreId / NUMA_NODE_NUM;
-		uint64_t workers_per_logger = g_thread_cnt / g_num_logger;
-		uint64_t projected_id = in_node_id * workers_per_logger + workerId + logger_per_node;
-		uint64_t hyperfactor_scale = projected_id / NUM_CORES_PER_SLOT;
-		assert(hyperfactor_scale < HYPER_THREADING_FACTOR);
-		
-		/*#if LOG_ALGORITHM != LOG_SERIAL // LOG_ALGORITHM == LOG_TAURUS || LOG_ALGORITHM == LOG_BATCH
-		if(workerId + 1 >= NUM_CORES_PER_SLOT)
-		{
-			// hyperthreading
-			workerId += NUM_CORES_PER_SLOT * 3;
-		}
-		#endif
-		*/
-		set_affinity(projected_id % NUM_CORES_PER_SLOT + node_id * NUM_CORES_PER_SLOT + hyperfactor_scale * NUM_CORES_PER_SLOT * NUMA_NODE_NUM ); 
-		//set_affinity(_thd_id + g_num_logger);
-		printf("Setting thread %lu (Worker %u of Logger %u) to CPU node %lu\n", GET_THD_ID, workerId, coreId, projected_id % NUM_CORES_PER_SLOT + node_id * NUM_CORES_PER_SLOT + hyperfactor_scale * NUM_CORES_PER_SLOT * NUMA_NODE_NUM);
-		int cpu = sched_getcpu();
-		int node = numa_node_of_cpu(cpu);
-		assert((uint64_t)node == node_id);
-	}
-	
+	#endif
+	set_affinity(coreId * NUM_CORES_PER_SLOT + workerId + 1); 
+	//set_affinity(_thd_id + g_num_logger);
+	printf("Setting thread %lu (Worker %u of Logger %u) to CPU node %u\n", GET_THD_ID, workerId, coreId, coreId * NUM_CORES_PER_SLOT + workerId + 1);
 #endif
 	//myrand rdm;
 	//rdm.init(get_thd_id());
@@ -105,7 +81,7 @@ RC thread_t::run() {
 		COMPILER_BARRIER
 		m_txn->recover();
 		COMPILER_BARRIER
-		INC_FLOAT_STATS_V0(run_time, get_sys_clock() - starttime);
+		INC_FLOAT_STATS(run_time, get_sys_clock() - starttime);
 		return FINISH;
 	}
 
@@ -213,16 +189,14 @@ RC thread_t::run() {
 
 		ts_t endtime = get_sys_clock();
 		uint64_t timespan = endtime - starttime;
-		INC_FLOAT_STATS_V0(run_time, timespan);
+		INC_FLOAT_STATS(run_time, timespan);
 		// running for more than 1000 seconds.
 //		if (stats._stats[GET_THD_ID]->run_time > 1000UL * 1000 * 1000 * 1000) {	
 //			cerr << "Running too long" << endl;
 //			exit(0);
 //		}
 		if (rc == RCOK) {
-//#if LOG_ALGORITHM == LOG_NO
-			INC_INT_STATS_V0(num_commits, 1);
-//#endif
+			INC_INT_STATS(num_commits, 1);
 			//cout << "Commit" << endl;
 			txn_cnt ++;
 			/*

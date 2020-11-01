@@ -25,7 +25,6 @@ void ycsb_txn_man::init(thread_t * h_thd, workload * h_wl, uint64_t thd_id) {
 }
 
 RC ycsb_txn_man::run_txn(base_query * query, bool rec) {
-	uint64_t starttime = get_sys_clock();
 	RC rc;
 	_query = (ycsb_query *) query;
 	ycsb_wl * wl = (ycsb_wl *) h_wl;
@@ -96,7 +95,6 @@ RC ycsb_txn_man::run_txn(base_query * query, bool rec) {
 	}
 	rc = RCOK;
 final:
-	INC_INT_STATS(time_txn, get_sys_clock() - starttime);
 	if (g_log_recover)
 		return RCOK;
 	else 
@@ -130,21 +128,17 @@ ycsb_txn_man::recover_txn(char * log_entry, uint64_t tid)
 		itemid_t * m_item = index_read(_wl->the_index, key, 0);
 		row_t * row = ((row_t *)m_item->location);
 	#if LOG_ALGORITHM == LOG_BATCH
-		// Silo needs to check versions
         uint64_t cur_tid = row->manager->get_tid(); // non-conflicting trial
         if (tid > cur_tid) { // optimization
-            row->manager->lock(this);
+            row->manager->lock();
             cur_tid = row->manager->get_tid();
             if (tid > cur_tid) { 
                 row->set_data(data, data_length);
                 row->manager->set_tid(tid);
             }
-            row->manager->release(this, RCOK);
+            row->manager->release();
         }
 	#else
-		// Plover with 2PL has independent log streams following the dependency order
-		// Taurus resolve dependencies before calling recover
-		// Serial has log streams corresponding to the dependency order
 		row->set_data(data, data_length);
 	#endif
 	}
@@ -213,7 +207,6 @@ ycsb_txn_man::recover_txn(char * log_entry, uint64_t tid)
 void 
 ycsb_txn_man::get_cmd_log_entry()
 {
-	#if LOG_ALGORITHM != LOG_PLOVER
 	// Format
 	//  | stored_procedure_id | num_keys | (key, type) * numk_eys
 	uint32_t sp_id = 0;
@@ -224,25 +217,6 @@ ycsb_txn_man::get_cmd_log_entry()
 	for (uint32_t i = 0; i < num_keys; i ++) {
 		PACK(_log_entry, _query->requests[i].key, _log_entry_size);
 		PACK(_log_entry, _query->requests[i].rtype, _log_entry_size);
-	}
-	#else
-	assert(false);
-	#endif
-}
-
-void 
-ycsb_txn_man::get_cmd_log_entry(char * log_entry, uint32_t & log_entry_size)
-{
-	// Format
-	//  | stored_procedure_id | num_keys | (key, type) * numk_eys
-	uint32_t sp_id = 0;
-	uint32_t num_keys = _query->request_cnt;
-
-	PACK(log_entry, sp_id, log_entry_size);
-	PACK(log_entry, num_keys, log_entry_size);
-	for (uint32_t i = 0; i < num_keys; i ++) {
-		PACK(log_entry, _query->requests[i].key, log_entry_size);
-		PACK(log_entry, _query->requests[i].rtype, log_entry_size);
 	}
 }
 

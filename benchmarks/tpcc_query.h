@@ -25,6 +25,7 @@ public:
 	uint64_t w_id;
 	uint64_t d_id;
 	uint64_t c_id;
+	uint64_t threshold;
 	/**********************************************/	
 	// txn input for payment
 	/**********************************************/	

@@ -20,7 +20,7 @@
 #define PAGE_SIZE					4096 
 #define CL_SIZE						64
 // CPU_FREQ is used to get accurate timing info 
-#define CPU_FREQ 					2.5	// in GHz/s // TODO: change this
+#define CPU_FREQ 					2.3 	// in GHz/s // TODO: change this
 
 // # of transactions to run for warmup
 #define WARMUP						0
@@ -29,10 +29,6 @@
 // print the transaction latency distribution
 #define PRT_LAT_DISTR				false
 #define STATS_ENABLE				true
-// 0 for only analysis related
-// 1 for debug
-// 2 for verbose
-#define STAT_VERBOSE				1
 #define COLLECT_LATENCY				false
 #define TIME_ENABLE					true 
 
@@ -47,6 +43,10 @@
 #define PART_ALLOC 					false
 #define MEM_SIZE					(1UL << 30) 
 #define NO_FREE						false
+
+// [RCU_ALLOC]
+#define RCU_ALLOC 					false
+#define RCU_ALLOC_SIZE     (20 * 1073741824UL)	// 20 GB
 
 /***********************************************/
 // Concurrency Control
@@ -120,7 +120,7 @@
 // Logging
 /***********************************************/
 
-#define LOG_ALGORITHM               LOG_PLOVER // LOG_TAURUS
+#define LOG_ALGORITHM               LOG_NO // LOG_TAURUS
 #define LOG_TYPE                    LOG_DATA
 #define LOG_RAM_DISK				false
 #define LOG_NO_FLUSH			 	false
@@ -262,7 +262,6 @@ extern TestCases					g_test_case;
 #define LOG_BATCH                   3
 #define LOG_PARALLEL                4
 #define LOG_TAURUS					5
-#define LOG_PLOVER					6
 // Logging type
 #define LOG_DATA					1
 #define LOG_COMMAND					2
@@ -272,24 +271,20 @@ extern TestCases					g_test_case;
 #define EVICT_FREQ					10000
 #define WITHOLD_LOG					false 
 #define COMPRESS_LSN_LT				false
-#define COMPRESS_LSN_LOG			false // false
+#define COMPRESS_LSN_LOG			true // false
 #define PSN_FLUSH_FREQ				1000
 #define LOCKTABLE_EVICT_BUFFER		30000
 #define SOLVE_LIVELOCK				true
 #define POOLSIZE_WAIT				2000 // if pool size is too small it might cause live lock.
+#define PER_WORKER_RECOVERY			false // false //true
 #define RECOVER_BUFFER_PERC			(0.5)
 #define TAURUS_RECOVER_BATCH_SIZE	(500)
 #define ASYNC_IO					true
 #define DECODE_AT_WORKER			false
-#define UPDATE_SIMD					true
+#define UPDATE_SIMD					false
 #define SCAN_WINDOW					2
 #define BIG_HASH_TABLE_MODE			true // true // false
 #define PROCESS_DEPENDENCY_LOGGER   false
-#define PARTITION_AWARE				false // this switch does not bring much benefit for YCSB
-#define PER_WORKER_RECOVERY			true // false //true
-#define TAURUS_CHUNK				true
-#define TAURUS_CHUNK_MEMCPY			true
-#define DISTINGUISH_COMMAND_LOGGING	true
 // big hash table mode means locktable evict buffer is infinite.
 /************************************/
 // LOG BATCH
@@ -303,57 +298,26 @@ extern TestCases					g_test_case;
 
 #define RECOVER_TAURUS_LOCKFREE		false  // Use the SPMC-Pool for each logger
 #define POOL_SE_SPACE (8)
+#define TPCC_FULL false
+#define TPCC_DBX1000_SERIAL_DELIVERY false
+#define TPCC_INSERT_INDEX true
+#define TPCC_INSERT_ROWS true
+#define TPCC_DELETE_ROWS true
+#define TPCC_DELETE_INDEX true
 
-#define FLUSH_BLOCK_SIZE		1048576 // twice as best among 4096 40960 409600 4096000
-#define READ_BLOCK_SIZE 419430400
+#define TPCC_SPLIT_DELIVERY false
+#define TPCC_VALIDATE_GAP false
+#define TPCC_VALIDATE_NODE false
+#define SIMPLE_INDEX_UPDATE false
+#define MAX_SCAN_PER_TXN 30
+#define TPCC_PHANTOM_AVOIDANCE false
+
+#define PHANTOM_SILO 0
+#define PHANTOM_LOCK 1
+#define TPCC_PHANTOM_AVOIDANCE_ALG PHANTOM_SILO
 
 #define AFFINITY true // true
 
-/************************************/
-// LOG PLOVER
-/************************************/
-
-#define PLOVER_NO_WAIT				true
-
-
-/************************************/
-// SIMD Config
-/************************************/
-
-#define G_NUM_LOGGER g_num_logger
-#define MAX_LOGGER_NUM_SIMD 16
-#define SIMD_PREFIX __m512i // __m256i
-#define MM_MAX _mm512_max_epu32 //_mm256_max_epu32
-#define MM_MASK __mmask16
-#define MM_CMP _mm512_cmp_epu32_mask
-#define MM_EXP_LOAD _mm512_maskz_expandloadu_epi32
-#define MM_INTERLEAVE_MASK 0x5555
-#define NUM_CORES_PER_SLOT	(24)
-#define NUMA_NODE_NUM	(2)
-#define HYPER_THREADING_FACTOR (2) // in total 24 * 2 * 2 = 96
-
-/************************************/
-#define OUTPUT_AVG_RATIO 0.9
-
 #include "config-assertions.h"
-
-#define MM_MALLOC(x,y) _mm_malloc(x, ALIGN_SIZE)
-#define MM_FREE(x,y) _mm_free(x)
-#include "numa.h"
-#define NUMA_MALLOC(x,y) numa_alloc_onnode(x, ((y) % g_num_logger) % NUMA_NODE_NUM)
-#define NUMA_FREE(x,y) numa_free(x, y)
-
-#if WORKLOAD == YCSB
-#define MALLOC NUMA_MALLOC
-#define FREE NUMA_FREE
-#else
-// TPC-C workloads are generating too many memory allocations.
-// Each numa_alloc_onnode will create a separate mmap. It could be disastrous
-#define MALLOC MM_MALLOC
-#define FREE MM_FREE
-#endif
-
-///////// MISC
-#define WORK_IN_PROGRESS true
 
 #endif

@@ -10,7 +10,6 @@
 #include "log.h"
 #include "serial_log.h"
 #include "parallel_log.h"
-#include "plover_log.h"
 #include "log_pending_table.h"
 #include "log_recover_table.h"
 #include "free_queue.h"
@@ -38,8 +37,6 @@ LogManager ** log_manager;
 LogManager ** log_manager; 
 LogRecoverTable * log_recover_table;
 uint64_t * starting_lsn;
-#elif LOG_ALGORITHM == LOG_PLOVER
-PloverLogManager * log_manager;
 #endif
 double g_epoch_period = EPOCH_PERIOD;
 uint32_t ** next_log_file_epoch;
@@ -107,8 +104,6 @@ double g_recover_buffer_perc = RECOVER_BUFFER_PERC;
 uint64_t g_rlv_delta = RLV_DELTA;
 uint32_t g_loggingthread_rlv_freq = 1;
 uint64_t g_queue_buffer_length;
-uint64_t g_flush_blocksize = FLUSH_BLOCK_SIZE;
-uint64_t g_read_blocksize = READ_BLOCK_SIZE;
 
 uint64_t g_psn_flush_freq = PSN_FLUSH_FREQ;
 uint64_t g_locktable_evict_buffer = LOCKTABLE_EVICT_BUFFER;
@@ -138,3 +133,4 @@ UInt32 g_cust_per_dist = 2000;
 UInt32 g_max_items = 100000;
 UInt32 g_cust_per_dist = 3000;
 #endif
+uint64_t g_max_orderline = uint64_t(1) << 32;

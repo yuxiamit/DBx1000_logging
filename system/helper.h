@@ -18,10 +18,6 @@
 #define NOGRAPHITE true
 #endif
 
-#include <time.h>
-#include <sys/time.h>
-// from stack overflow
-
 /************************************************/
 // atomic operations
 /************************************************/
@@ -117,20 +113,12 @@
 #define INC_GLOB_STATS(name, value) \
 	;
 
-#define INC_FLOAT_STATS_V0(name, value) {{ \
-	if (STATS_ENABLE && STAT_VERBOSE >= 0) \
-		stats->_stats[GET_THD_ID]->_float_stats[STAT_##name] += value; }}
-
 #define INC_FLOAT_STATS(name, value) {{ \
-	if (STATS_ENABLE && STAT_VERBOSE >= 1) \
+	if (STATS_ENABLE) \
 		stats->_stats[GET_THD_ID]->_float_stats[STAT_##name] += value; }}
-
-#define INC_INT_STATS_V0(name, value) {{ \
-	if (STATS_ENABLE && STAT_VERBOSE >= 0) \
-		stats->_stats[GET_THD_ID]->_int_stats[STAT_##name] += value; }}
 
 #define INC_INT_STATS(name, value) {{ \
-	if (STATS_ENABLE && STAT_VERBOSE >= 1) \
+	if (STATS_ENABLE) \
 		stats->_stats[GET_THD_ID]->_int_stats[STAT_##name] += value; }}
 
 /*#define INC_STATS(tid, name, value) { \
@@ -188,8 +176,9 @@
 		*name[i] = value; \
 
 #define MALLOC_CONSTRUCTOR(type, var) \
-	{var = (type *) MALLOC(sizeof(type), GET_THD_ID); \
+	{var = (type *) _mm_malloc(sizeof(type), ALIGN_SIZE); \
 	new(var) type();}
+
 
 /////////////////////////////
 // packatize helper 
@@ -243,14 +232,6 @@ uint64_t merge_idx_key(uint64_t key_cnt, uint64_t * keys);
 uint64_t merge_idx_key(uint64_t key1, uint64_t key2);
 uint64_t merge_idx_key(uint64_t key1, uint64_t key2, uint64_t key3);
 
-inline double get_wall_time(){ // used to calibrate wrong CPU_FREQ
-    struct timeval time;
-    if (gettimeofday(&time,NULL)){
-        //  Handle error
-        return 0;
-    }
-    return (double)time.tv_sec + (double)time.tv_usec * .000001;
-}
 extern timespec * res;
 inline uint64_t get_server_clock() {
 #if defined(__i386__)
@@ -383,14 +364,6 @@ static inline void *aa_alloc(uint size, uint align)
 #ifndef O_DIRECT
 #define O_DIRECT (0)
 #endif
-
-inline uint64_t aligned(uint64_t size)
-{
-	if (size % ALIGN_SIZE == 0) return size;
-	return size / ALIGN_SIZE * ALIGN_SIZE + ALIGN_SIZE;
-}
-
-#define MAX(a, b) ((a)>(b)?(a):(b))
 
 /*
 #if defined(__clang__) || defined (__GNUC__)

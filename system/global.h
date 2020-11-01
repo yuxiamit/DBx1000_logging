@@ -28,7 +28,6 @@
 #include "config.h"
 #include "stats.h"
 #include "dl_detect.h"
-//#include "row.h"
 
 #include "barrier.h"
 
@@ -45,7 +44,6 @@ class VLLMan;
 class LogManager;
 class SerialLogManager;
 class TaurusLogManager;
-class PloverLogManager;
 class ParallelLogManager;
 class LogPendingTable;
 class LogRecoverTable;
@@ -86,8 +84,6 @@ extern LogManager ** log_manager;
 extern LogManager ** log_manager;
 extern LogRecoverTable * log_recover_table;
 extern uint64_t * starting_lsn;
-#elif LOG_ALGORITHM == LOG_PLOVER
-extern PloverLogManager * log_manager;
 #endif
 extern double g_epoch_period;
 extern uint32_t ** next_log_file_epoch;
@@ -170,8 +166,6 @@ extern UInt32 g_locktable_init_slots;
 extern UInt32 g_field_per_tuple;
 extern UInt32 g_init_parallelism;
 extern uint64_t g_queue_buffer_length;
-extern uint64_t g_flush_blocksize;
-extern uint64_t g_read_blocksize;
 
 // TPCC
 extern UInt32 g_num_wh;
@@ -179,6 +173,7 @@ extern double g_perc_payment;
 extern bool g_wh_update;
 extern UInt32 g_max_items;
 extern UInt32 g_cust_per_dist;
+extern uint64_t g_max_orderline;
 
 extern uint64_t PRIMES[];
 
@@ -195,6 +190,8 @@ typedef uint64_t txn_t;
 typedef uint64_t rid_t; // row id
 typedef uint64_t pgid_t; // page id
 
+
+
 /* INDEX */
 enum latch_t {LATCH_EX, LATCH_SH, LATCH_NONE};
 // accessing type determines the latch type on nodes
@@ -203,18 +200,15 @@ typedef uint64_t idx_key_t; // key id for index
 typedef uint64_t (*func_ptr)(idx_key_t);	// part_id func_ptr(index_key);
 
 #if UPDATE_SIMD
-typedef uint32_t lsnType; // 256bit
+typedef uint32_t lsnType;
 #else
 typedef uint64_t lsnType;
 #endif
 
-#define STR(x)   #x
-#define SHOW_DEFINE(x) printf("%s=%s\n", #x, STR(x))
-
 /* general concurrency control */
-enum access_t {RD, WR, XP, SCAN};
+enum access_t {RD, WR, XP, SCAN, IS, DL};
 /* LOCK */
-enum lock_t {LOCK_NONE_T, LOCK_SH_T, LOCK_EX_T };
+enum lock_t {LOCK_EX_T, LOCK_SH_T, LOCK_NONE_T };
 /* TIMESTAMP */
 enum TsType {R_REQ, W_REQ, P_REQ, XP_REQ}; 
 
@@ -230,6 +224,9 @@ enum TsType {R_REQ, W_REQ, P_REQ, XP_REQ};
 #define INDEX		IndexHash
 #endif
 
+#define HASH_INDEX		IndexHash
+#define ARRAY_INDEX		IndexArray
+#define ORDERED_INDEX	IndexMBTree
 /************************************************/
 // constants
 /************************************************/
@@ -241,5 +238,6 @@ enum TsType {R_REQ, W_REQ, P_REQ, XP_REQ};
 #endif // UINT64_MAX
 
 #define CONTENTION_THRESHOLD (1.0f)
+#define NUM_CORES_PER_SLOT	(8)
 
 #define RLV_DELTA (10000)

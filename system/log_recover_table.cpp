@@ -119,7 +119,7 @@ LogRecoverTable::TxnPool::TxnPool()
 	_pools = new boost::lockfree::queue< TxnNode * > * [_num_pools];
 	for (uint32_t i = 0; i < _num_pools; i ++) {
 		_pools[i] = (boost::lockfree::queue< TxnNode * > *) 
-			MALLOC(sizeof(boost::lockfree::queue< TxnNode * >{1000}), GET_THD_ID);
+			_mm_malloc(sizeof(boost::lockfree::queue< TxnNode * >{1000}), ALIGN_SIZE);
 		new(_pools[i]) boost::lockfree::queue< TxnNode * >{1000};
 	}
 }
@@ -187,31 +187,31 @@ LogRecoverTable::LogRecoverTable()
 	_num_free_nodes_per_thread = g_log_parallel_num_buckets / g_thread_cnt;
 	
 	for (uint32_t i = 0; i < g_thread_cnt; i ++) {
-		_recover_done[i] = (bool *) MALLOC(sizeof(bool) * g_thread_cnt, GET_THD_ID);
+		_recover_done[i] = (bool *) _mm_malloc(sizeof(bool) * g_thread_cnt, ALIGN_SIZE);
 		_free_nodes[i] = new TxnNode[_num_free_nodes_per_thread];
-		_next_free_node_idx[i] = (uint32_t *) MALLOC(sizeof(uint32_t), GET_THD_ID);
+		_next_free_node_idx[i] = (uint32_t *) _mm_malloc(sizeof(uint32_t), ALIGN_SIZE);
 		*_next_free_node_idx[i] = 0;
 		*_recover_done[i] = true;
 	}
 
     //for (uint32_t i = 0; i < _num_buckets; i ++)
-    //    _buckets[i] = (Bucket *) MALLOC(sizeof(Bucket), GET_THD_ID); 
+    //    _buckets[i] = (Bucket *) _mm_malloc(sizeof(Bucket), ALIGN_SIZE); 
     //_free_nodes = new stack<TxnNode *> * [g_thread_cnt];
 
 /*    _gc_queue = new queue<GCQEntry *> * [g_num_logger];
 	_gc_entries = new stack<GCQEntry *> * [g_num_logger];
     _gc_bound = new int64_t volatile  * [g_num_logger];
     for (uint32_t i = 0; i < g_num_logger; i++) {
-        _gc_bound[i] = (int64_t volatile *) MALLOC(sizeof(int64_t), GET_THD_ID);
-		_gc_queue[i] = (queue<GCQEntry *> *) MALLOC(sizeof(queue<GCQEntry *>), GET_THD_ID);
+        _gc_bound[i] = (int64_t volatile *) _mm_malloc(sizeof(int64_t), ALIGN_SIZE);
+		_gc_queue[i] = (queue<GCQEntry *> *) _mm_malloc(sizeof(queue<GCQEntry *>), ALIGN_SIZE);
 		new(_gc_queue[i]) queue<GCQEntry *>;
-		_gc_entries[i] = (stack<GCQEntry *> *) MALLOC(sizeof(stack<GCQEntry *>), GET_THD_ID);
+		_gc_entries[i] = (stack<GCQEntry *> *) _mm_malloc(sizeof(stack<GCQEntry *>), ALIGN_SIZE);
 		new(_gc_entries[i]) stack<GCQEntry *>;
 
         *_gc_bound[i] = -1;
     }
     for (uint32_t i = 0; i < g_thread_cnt; i++) { 
-		_free_nodes[i] = (stack<TxnNode *> *) MALLOC(sizeof(stack<TxnNode *>), GET_THD_ID);
+		_free_nodes[i] = (stack<TxnNode *> *) _mm_malloc(sizeof(stack<TxnNode *>), ALIGN_SIZE);
 		new(_free_nodes[i]) stack<TxnNode *>;
 	}
 */	
@@ -631,7 +631,7 @@ LogRecoverTable::add_fence(uint64_t commit_ts)
 {
 	GCQEntry * entry = NULL; 
 	if (_gc_entries[GET_THD_ID]->empty()) {
-		entry = (GCQEntry *) MALLOC(sizeof(GCQEntry), GET_THD_ID);
+		entry = (GCQEntry *) _mm_malloc(sizeof(GCQEntry), ALIGN_SIZE);
 		new(entry) GCQEntry();
 	} else { 
 		entry = _gc_entries[GET_THD_ID]->top();
@@ -654,7 +654,7 @@ LogRecoverTable::insert_gc_entry(uint64_t txn_id)
 {
 	GCQEntry * entry = NULL; 
 	if (_gc_entries[GET_THD_ID]->empty()) {
-		entry = (GCQEntry *) MALLOC(sizeof(GCQEntry), GET_THD_ID);
+		entry = (GCQEntry *) _mm_malloc(sizeof(GCQEntry), ALIGN_SIZE);
 		new(entry) GCQEntry();
 	} else { 
 		entry = _gc_entries[GET_THD_ID]->top();
@@ -681,7 +681,7 @@ LogRecoverTable::add_log_recover(RecoverState * recover_state)
 			_free_nodes[GET_THD_ID]->pop();
 			next_node->clear();
 		} else { 
-        	next_node = (TxnNode *) MALLOC(sizeof(TxnNode), GET_THD_ID);
+        	next_node = (TxnNode *) _mm_malloc(sizeof(TxnNode), ALIGN_SIZE);
 	        new(next_node) TxnNode(txn_id);
 		}
 	}
@@ -846,7 +846,7 @@ LogRecoverTable::add_empty_node(uint64_t txn_id)
 		_free_nodes[GET_THD_ID]->pop();
 		new_node->clear();
 	} else { 
-       	new_node = (TxnNode *) MALLOC(sizeof(TxnNode), GET_THD_ID);
+       	new_node = (TxnNode *) _mm_malloc(sizeof(TxnNode), ALIGN_SIZE);
         new(new_node) TxnNode(txn_id);
 	}
 	new_node->txn_id = txn_id;

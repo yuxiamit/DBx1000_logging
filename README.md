@@ -1,41 +1,43 @@
-# DBx1000_logging
-The logging module of the DBx1000 database.
+DBx1000
+=======
 
-We include a number of logging algorithms in this module:
+DBx1000 is an single node OLTP database management system (DBMS). The goal of DBx1000 is to make DBMS scalable on future 1000-core processors. We implemented all the seven classic concurrency control schemes in DBx1000. They exhibit different scalability properties under different workloads. 
 
-+ [Taurus](https://arxiv.org/abs/2010.06760)
-+ Silo-R
-+ Serial
-+ Plover
+The concurrency control scalability study is described in the following paper. 
 
-The full TPC-C implementation is deeply coupled with 2PL. Therefore, we put it in a separate repo.
+    Staring into the Abyss: An Evaluation of Concurrency Control with One Thousand Cores
+    Xiangyao Yu, George Bezerra, Andrew Pavlo, Srinivas Devadas, Michael Stonebraker
+    http://www.vldb.org/pvldb/vol8/p209-yu.pdf
+    
+Build & Test
+------------
 
-Thank you for your interest in this logging module. Please feel free to submit issues. Contributions are welcome.
+To build the database.
 
-### Dependencies and Compiling
+    make -j
 
-To install dependencies from Ubuntu:
+To test the database
 
-	sudo sh scripts/prepareEC2_metal.sh
+    python test.py
+    
+Configuration
+-------------
 
-To compile the baselines:
+DBMS configurations can be changed in the config.h file. Please refer to README for the meaning of each configuration. Here we only list several most important ones. 
 
-	python tools/compile
+    THREAD_CNT        : Number of worker threads running in the database.
+    WORKLOAD          : Supported workloads include YCSB and TPCC
+    CC_ALG            : Concurrency control algorithm. Seven algorithms are supported 
+                        (DL_DETECT, NO_WAIT, HEKATON, SILO, TICTOC) 
+    MAX_TXN_PER_PART  : Number of transactions to run per thread per partition.
+                        
+Configurations can also be specified as command argument at runtime. Run the following command for a full list of program argument. 
+    
+    ./rundb -h
 
-### Reproduce the Experiments
+Run
+---
 
-We also include a script (ec2/runspot.py) to automate the EC2 setup. Please fill in the configuration file (ec2/config.ini) before you run the setup script.
+The DBMS can be run with 
 
-To reproduce the experiments:
-
-	python scripts/runExpr.py run_all
-
-Specifically, the experiments on *h1_16xlarge* are included in
-
-	python scripts/runExpr.py allhdd
-
-And the experiments on *i3_en.metal* are included in
-
-	python scripts/runExpr.py all16
-
-The plotting script is at *scripts/generateFigures.py*.
+    ./rundb

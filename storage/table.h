@@ -7,18 +7,21 @@
 class Catalog;
 class row_t;
 class IndexHash;
+class IndexMBTree;
+class IndexArray;
 class index_btree;
 
 class table_t
 {
 public:
 	void init(Catalog * schema);
+	void init(Catalog * schema, uint64_t part_cnt);
 	// row lookup should be done with index. But index does not have
 	// records for new rows. get_new_row returns the pointer to a 
 	// new row.	
 	RC get_new_row(row_t *& row); // this is equivalent to insert()
-	RC get_new_row(row_t *& row, uint64_t part_id, uint64_t &row_id, uint64_t local_id);
-	RC get_new_row(row_t *& row, uint64_t part_id, uint64_t &row_id, void * mem, void * manager_mem, void * data_mem, void * lsn_vector_mem);
+	RC get_new_row(row_t *& row, uint64_t part_id, uint64_t &row_id);
+	RC get_new_row(row_t *& row, uint64_t part_id, uint64_t &row_id, void * mem, void * manager_mem, void * data_mem);
 
 	void delete_row(); // TODO delete_row is not supportet yet
 
@@ -31,13 +34,21 @@ public:
 
 	void set_primary_index(INDEX * primary_index) { _primary_index = primary_index; }
 	INDEX * get_primary_index() { return _primary_index; }
+	void set_primary_ordered_index(ORDERED_INDEX* index) {_primary_ordered_index = index;}
+	ORDERED_INDEX* get_primary_ordered_index() {return _primary_ordered_index;}
 
 	Catalog * 		schema;
+	#if TPCC_PHANTOM_AVOIDANCE && TPCC_PHANTOM_AVOIDANCE_ALG == PHANTOM_LOCK
+	row_t*			tablewise_lock;
+	uint64_t		ex_lock_owner;
+	#endif
 private:
 	const char * 	table_name;
 	uint32_t 		_table_id;
 	uint64_t  		cur_tab_size;
+	uint64_t		part_cnt;
 	char 			pad[CL_SIZE - sizeof(void *)*3];
 
 	INDEX * 		_primary_index; 
+	ORDERED_INDEX * _primary_ordered_index;
 };

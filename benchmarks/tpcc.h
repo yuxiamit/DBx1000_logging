@@ -24,7 +24,7 @@ public:
 	table_t *		t_orderline;
 	table_t *		t_item;
 	table_t *		t_stock;
-
+/*
 	INDEX * 	i_item;
 	INDEX * 	i_warehouse;
 	INDEX * 	i_district;
@@ -34,6 +34,30 @@ public:
 	INDEX * 	i_order; // key = (w_id, d_id, o_id)
 	INDEX * 	i_orderline; // key = (w_id, d_id, o_id)
 	INDEX * 	i_orderline_wd; // key = (w_id, d_id). 
+	*/
+	HASH_INDEX* i_item;
+	HASH_INDEX* i_warehouse;
+	HASH_INDEX* i_district;
+	HASH_INDEX* i_customer_id;
+	HASH_INDEX* i_customer_last;
+	HASH_INDEX* i_stock;
+	ORDERED_INDEX* i_order;
+	ORDERED_INDEX* i_order_cust;
+	ORDERED_INDEX* i_neworder;
+	ORDERED_INDEX* i_orderline;
+
+	enum I_INDEX_ID {
+		IID_ITEM,
+		IID_WAREHOUSE,
+		IID_DISTRICT,
+		IID_CUSTOMER_ID,
+		IID_CUSTOMER_LAST,
+		IID_STOCK,
+		IID_ORDER,
+		IID_ORDER_CUST,
+		IID_NEWORDER,
+		IID_ORDERLINE,
+	};
 	
 	bool ** delivering;
 	uint32_t next_tid;
@@ -69,7 +93,6 @@ public:
 	RC run_txn(base_query * query, bool rec=false);
 	
 	void get_cmd_log_entry();
-	void get_cmd_log_entry(char * log_entry, uint32_t & log_entry_size);
 	uint32_t get_cmd_log_entry_length();
 private:
 	tpcc_wl * _wl;
@@ -79,8 +102,31 @@ private:
 	RC run_delivery(tpcc_query * query);
 	RC run_stock_level(tpcc_query * query);
 
+#if TPCC_DBX1000_SERIAL_DELIVERY
+  struct ActiveDelivery {
+    uint32_t lock;
+  } __attribute__((aligned(CL_SIZE)));
+
+  ActiveDelivery active_delivery[NUM_WH];
+#endif
+
 	tpcc_query * _query; 	
 	//TPCCTxnType	_txn_type;
+	bool delivery_getNewOrder_deleteNewOrder(uint64_t d_id, uint64_t w_id,
+                                           int64_t* out_o_id);
+	row_t* delivery_getCId(int64_t no_o_id, uint64_t d_id, uint64_t w_id);
+	void delivery_updateOrders(row_t* row, uint64_t o_carrier_id);
+	bool delivery_updateOrderLine_sumOLAmount(uint64_t o_entry_d, int64_t no_o_id,
+												uint64_t d_id, uint64_t w_id,
+												double* out_ol_total);
+	bool delivery_updateCustomer(double ol_total, uint64_t c_id, uint64_t d_id,
+								uint64_t w_id);
+
+	row_t* stock_level_getOId(uint64_t d_w_id, uint64_t d_id);
+	bool stock_level_getStockCount(uint64_t ol_w_id, uint64_t ol_d_id,
+									int64_t ol_o_id, uint64_t s_w_id,
+									uint64_t threshold,
+									uint64_t* out_distinct_count);
 
 	void recover_txn(char * log_entry, uint64_t tid = (uint64_t)-1);
 };
