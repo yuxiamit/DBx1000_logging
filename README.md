@@ -8,7 +8,7 @@ We include a number of logging algorithms in this module:
 + Serial
 + Plover
 
-The full TPC-C implementation is deeply coupled with 2PL. Therefore, we put it in a separate repo.
+The full TPC-C implementation is in the *fulltpcc* branch.
 
 Thank you for your interest in this logging module. Please feel free to submit issues. Contributions are welcome.
 
