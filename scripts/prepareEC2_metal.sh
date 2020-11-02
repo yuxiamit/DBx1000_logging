@@ -3,9 +3,9 @@ sudo apt update
 sudo apt install -y git
 sudo apt install -y unzip
 # git clone https://github.com/yuxiamit/dbx1000_logging.git
-mkdir dbx1000_logging
-cd ~/dbx1000_logging
-unzip -o dbx1000_logging.zip -d dbx1000_logging
+#mkdir dbx1000_logging
+#cd ~/dbx1000_logging
+#unzip -o dbx1000_logging.zip -d dbx1000_logging
 # git checkout array-lock-free
 sudo apt install -y libboost-dev
 sudo apt install -y libjemalloc-dev
