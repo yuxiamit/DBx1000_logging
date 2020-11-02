@@ -20,7 +20,7 @@ To install dependencies from Ubuntu:
 
 To compile the baselines:
 
-	python tools/compile
+	python tools/compile.py
 
 ### Reproduce the Experiments
 
